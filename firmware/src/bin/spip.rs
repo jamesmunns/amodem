@@ -3,13 +3,37 @@
 
 #![allow(unused_imports)]
 
+use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+
 use amodem::{self as _, GlobalRollingTimer}; // global logger + panicking-behavior + memory layout
 
+use cortex_m::peripheral::NVIC;
 use rand_chacha::{ChaCha8Rng, rand_core::{SeedableRng, RngCore}};
 use stm32g0xx_hal as hal;
-use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB}};
+use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB}, exti::{ExtiExt, Event}};
 use groundhog::RollingTimer;
 use hal::interrupt;
+
+static SPI_MODE: AtomicU8 = AtomicU8::new(MODE_IDLE);
+
+const MODE_IDLE: u8 = 0b000_00000;
+const MODE_RELOAD: u8 = 0b000_00001;
+
+
+// TODO: This should probably be an enum or something. Be careful when updating.
+//
+const MODE_MASK: u8 = 0b111_00000;
+
+const MODE_LONG_PKT_READ: u8 = 0b001_00000;
+const MODE_LONG_PKT_WRITE: u8 = 0b010_00000;
+const MODE_SHORT_REG_READ: u8 = 0b011_00000;
+const MODE_SHORT_REG_WRITE: u8 = 0b100_00000;
+const MODE_INVALID_WAIT: u8 = 0b111_00000;
+//
+// ENDTODO
+
+const ONE_ATOMIC: AtomicU16 = AtomicU16::new(0xACAB);
+static REGS: [AtomicU16; 32] = [ONE_ATOMIC; 32];
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
@@ -27,7 +51,7 @@ fn main() -> ! {
 
 fn imain() -> Option<()> {
     let board = stm32::Peripherals::take()?;
-    let _core = stm32::CorePeripherals::take()?;
+    // let core = stm32::CorePeripherals::take()?;
 
     // Configure clocks
     let config = Config::pll()
@@ -40,6 +64,7 @@ fn imain() -> Option<()> {
     SPI1::reset(&mut rcc);
     GPIOA::enable(&mut rcc);
     GPIOB::enable(&mut rcc);
+
 
     let gpioa = board.GPIOA;
     let gpiob = board.GPIOB;
@@ -100,7 +125,7 @@ fn imain() -> Option<()> {
         // w.crcl();
         w.rxonly().full_duplex();
         w.ssm().disabled();
-        w.ssi().slave_selected(); // ?
+        // w.ssi();
         w.lsbfirst().msbfirst();
         // w.spe();
         w.br().div2();
@@ -143,63 +168,187 @@ fn imain() -> Option<()> {
     // * (Note 3) Step is not required in NSSP mode.
     // * (Note 4) The step is not required in slave mode except slave working at TI mode
 
-    gpioa.odr.modify(|_r, w| w.odr7().low());
-    let start = timer.get_ticks();
-    while timer.millis_since(start) < 100 { }
-
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
     let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
-    // 4001300C
-    defmt::println!("dr8b: {:08X}", dr8b as usize as u32);
     spi1.cr1.modify(|_r, w| w.spe().enabled());
 
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    board.EXTI.exticr1.modify(|_r, w| {
+        w.exti0_7().pb();
+        w
+    });
+    board.EXTI.listen(Event::GPIO0, hal::gpio::SignalEdge::Rising);
 
-    let sr = spi1.sr.read().bits();
-    defmt::println!("SRA: {:04X}", sr);
+    // TODO: Interrupt priority
+    //
+    // I definitely want EXTI to be higher than SPI1, not sure wrt USART/DMA ints.
 
+    // Enable EXTI int
     unsafe {
-        dr8b.write_volatile(0x42);
-        dr8b.write_volatile(0x69);
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
     }
 
-    let sr = spi1.sr.read().bits();
-    defmt::println!("SRB: {:04X}", sr);
+    loop {
+        // Clear ERR flags
+        // ? TODO
 
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // Push two dummy bytes
+        unsafe {
+            dr8b.write_volatile(0x12);
+            dr8b.write_volatile(0x34);
+        }
 
-    defmt::println!("Waiting...");
+        // Enable RXNE Int
+        spi1.cr2.modify(|_r, w| w.rxneie().not_masked());
+
+        // Clear Busy Flag
+        set_not_busy();
+
+        defmt::println!("Waiting!");
+
+        // WFI until EXTI
+        while SPI_MODE.load(Ordering::Relaxed) != MODE_RELOAD {
+            cortex_m::asm::nop();
+        }
+
+        defmt::println!("DONG");
+
+        // Cleanup? Handle things NOT in interrupt context?
+        SPI_MODE.store(MODE_IDLE, Ordering::Relaxed);
+    }
+
+
+
+
+
+
+    // let mut rx = [0xFF; 2];
+    // rx.iter_mut().for_each(|b| {
+    //     while spi1.sr.read().rxne().is_empty() { }
+    //     *b = unsafe { dr8b.read_volatile() };
+    // });
+
+
+    // while !board.EXTI.is_pending(Event::GPIO0, hal::gpio::SignalEdge::Rising) { }
+    // gpioa.odr.modify(|_r, w| w.odr7().low());
+    // defmt::println!("ding.");
+
+    // defmt::println!("Got data: {:?}", &rx);
+    // let sr = spi1.sr.read().bits();
+    // defmt::println!("SRC: {:04X}", sr);
+
+    // let start = timer.get_ticks();
+    // while timer.millis_since(start) < 100 { }
+
+    // // let x = stm32g0xx_hal::pac::Interrupt::EXTI0_1;
+
+    // Some(())
+}
+
+fn set_busy() {
+    let gpioa = unsafe { &*GPIOA::PTR };
     gpioa.odr.modify(|_r, w| w.odr7().high());
+}
 
-    let mut rx = [0xFF; 2];
-    rx.iter_mut().for_each(|b| {
-        while spi1.sr.read().rxne().is_empty() { }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        *b = unsafe { dr8b.read_volatile() };
-    });
-
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-    defmt::println!("Got data: {:?}", &rx);
-    let sr = spi1.sr.read().bits();
-    defmt::println!("SRC: {:04X}", sr);
-
+fn set_not_busy() {
+    let gpioa = unsafe { &*GPIOA::PTR };
     gpioa.odr.modify(|_r, w| w.odr7().low());
-    let start = timer.get_ticks();
-    while timer.millis_since(start) < 100 { }
-
-    // let x = stm32g0xx_hal::pac::Interrupt::EXTI0_1;
-
-    Some(())
 }
 
 #[interrupt]
 fn EXTI0_1() {
+    let val = SPI_MODE.load(Ordering::Relaxed);
+    let mode = val & MODE_MASK;
+    let low = val & !MODE_MASK;
 
+    let exti = unsafe { &*hal::pac::EXTI::PTR };
+    let spi1 = unsafe { &*SPI1::PTR };
+    let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
+
+    exti.rpr1.modify(|_r, w| w.rpif0().set_bit());
+
+    match mode {
+        MODE_SHORT_REG_READ => {
+            // We have already sent the value, and we don't care about
+            // the data sent to us here. The FIFO will be drained below.
+        },
+        MODE_SHORT_REG_WRITE => {
+            // We need to get the next two bytes out of the FIFO to store to the
+            // proper register.
+            let pop_byte = || {
+                if !spi1.sr.read().rxne().is_empty() {
+                    Some(unsafe { dr8b.read_volatile() })
+                } else {
+                    None
+                }
+            };
+
+            if let (Some(a), Some(b)) = (pop_byte(), pop_byte()) {
+                let val = u16::from_le_bytes([a, b]);
+                defmt::println!("Wrote {:04X} to {:?}", val, low);
+                REGS[low as usize].store(val, Ordering::Relaxed);
+            }
+        },
+        MODE_LONG_PKT_READ => defmt::unimplemented!(),
+        MODE_LONG_PKT_WRITE => defmt::unimplemented!(),
+        _ => {
+            // Huh, that was weird.
+        },
+    }
+
+    while !spi1.sr.read().rxne().is_empty() {
+        let _ = unsafe { dr8b.read_volatile() };
+    }
+
+    // TODO: Drain TX FIFO?
+    defmt::println!("BING BOOM");
+    SPI_MODE.store(MODE_RELOAD, Ordering::Relaxed);
+    set_not_busy();
 }
 
 #[interrupt]
 fn SPI1() {
+    // Set Busy Pin
+    set_busy();
+
+    let spi1 = unsafe { &*SPI1::PTR };
+    let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
+    let dr16b: *mut u16 = spi1.dr.as_ptr().cast();
+
+    // Disable RXNE interrupt
+    spi1.cr2.modify(|_r, w| w.rxneie().masked());
+
+    // defmt::assert!(!spi1.sr.read().rxne().is_empty());
+    let mode = SPI_MODE.load(Ordering::Relaxed);
+    if mode != MODE_IDLE {
+        return;
+    }
+
+    // Read first FIFO byte
+    let fbyte = unsafe { dr8b.read_volatile() };
+
+    let mode = fbyte & MODE_MASK;
+    let low = fbyte & !MODE_MASK;
+
+    match mode {
+        MODE_SHORT_REG_READ => {
+            // Push two bytes into the FIFO.
+            let val = REGS[low as usize].load(Ordering::Relaxed);
+            unsafe {
+                dr16b.write_volatile(val);
+            };
+            // Wait for EXTI to complete
+            SPI_MODE.store(MODE_SHORT_REG_READ, Ordering::Relaxed);
+        },
+        MODE_SHORT_REG_WRITE => {
+            // Nothing else to do, just wait for EXTI.
+            SPI_MODE.store(fbyte, Ordering::Relaxed);
+        },
+        MODE_LONG_PKT_READ => defmt::unimplemented!(),
+        MODE_LONG_PKT_WRITE => defmt::unimplemented!(),
+        _ => {
+            // Nothing else to do, just wait for EXTI.
+            SPI_MODE.store(MODE_INVALID_WAIT, Ordering::Relaxed);
+        },
+    }
 
 }

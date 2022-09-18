@@ -63,28 +63,89 @@ fn imain() -> Option<()> {
             miso: Some(miso),
             mosi: Some(mosi),
         },
-        SpimFreq::K125,
+        SpimFreq::M1,
         MODE_0,
         0,
     );
 
-    let start = timer.get_ticks();
 
-    let mut bufout = [0u8; 2];
-    for (i, b) in bufout.iter_mut().enumerate() {
-        *b = i as u8 + 64;
+    // const MODE_LONG_PKT_READ: u8 = 0b001_00000;
+    // const MODE_LONG_PKT_WRITE: u8 = 0b010_00000;
+    // const MODE_SHORT_REG_READ: u8 = 0b011_00000;
+    // const MODE_SHORT_REG_WRITE: u8 = 0b100_00000;
+    // const MODE_INVALID_WAIT: u8 = 0b111_00000;
+
+    let mut bufout = [0u8; 4];
+
+    // Read
+    {
+        let start = timer.get_ticks();
+
+        bufout.copy_from_slice(&[
+            0b011_00000,
+            0x00,
+            0x00,
+            0x00,
+        ]);
+
+        while timer.millis_since(start) < 250 { }
+
+        match spi.transfer(&mut csn, &mut bufout) {
+            Ok(_) => {
+                defmt::println!("OK");
+                defmt::println!("{:02X}", &bufout);
+            },
+            Err(_) => {
+                defmt::println!("ERR");
+            },
+        }
     }
 
-    while timer.millis_since(start) < 250 { }
+    // Write
+    {
+        let start = timer.get_ticks();
 
-    match spi.transfer(&mut csn, &mut bufout) {
-        Ok(_) => {
-            defmt::println!("OK");
-            defmt::println!("{:?}", &bufout);
-        },
-        Err(_) => {
-            defmt::println!("ERR");
-        },
+        bufout[..3].copy_from_slice(&[
+            0b100_00000,
+            0x09,
+            0x87,
+        ]);
+
+        while timer.millis_since(start) < 250 { }
+
+        match spi.transfer(&mut csn, &mut bufout[..3]) {
+            Ok(_) => {
+                defmt::println!("OK");
+                defmt::println!("{:02X}", &bufout[..3]);
+            },
+            Err(_) => {
+                defmt::println!("ERR");
+            },
+        }
+    }
+
+    // Read
+    {
+        let start = timer.get_ticks();
+
+        bufout.copy_from_slice(&[
+            0b011_00000,
+            0x00,
+            0x00,
+            0x00,
+        ]);
+
+        while timer.millis_since(start) < 250 { }
+
+        match spi.transfer(&mut csn, &mut bufout) {
+            Ok(_) => {
+                defmt::println!("OK");
+                defmt::println!("{:02X}", &bufout);
+            },
+            Err(_) => {
+                defmt::println!("ERR");
+            },
+        }
     }
 
     Some(())
