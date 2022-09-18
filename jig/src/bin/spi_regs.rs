@@ -88,7 +88,7 @@ fn imain() -> Option<()> {
             0x00,
         ]);
 
-        while timer.millis_since(start) < 250 { }
+        while timer.micros_since(start) < 100 { }
 
         match spi.transfer(&mut csn, &mut bufout) {
             Ok(_) => {
@@ -111,7 +111,7 @@ fn imain() -> Option<()> {
             0x87,
         ]);
 
-        while timer.millis_since(start) < 250 { }
+        while timer.micros_since(start) < 100 { }
 
         match spi.transfer(&mut csn, &mut bufout[..3]) {
             Ok(_) => {
@@ -135,7 +135,7 @@ fn imain() -> Option<()> {
             0x00,
         ]);
 
-        while timer.millis_since(start) < 250 { }
+        while timer.micros_since(start) < 100 { }
 
         match spi.transfer(&mut csn, &mut bufout) {
             Ok(_) => {

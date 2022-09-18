@@ -3,14 +3,14 @@
 
 #![allow(unused_imports)]
 
-use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use core::{sync::atomic::{AtomicU8, AtomicU16, Ordering}, cell::UnsafeCell, mem::MaybeUninit};
 
 use amodem::{self as _, GlobalRollingTimer}; // global logger + panicking-behavior + memory layout
 
 use cortex_m::peripheral::NVIC;
 use rand_chacha::{ChaCha8Rng, rand_core::{SeedableRng, RngCore}};
 use stm32g0xx_hal as hal;
-use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB}, exti::{ExtiExt, Event}};
+use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB, DMA}, exti::{ExtiExt, Event}, dma::{DmaExt, C1, Channel, WordSize, Direction}};
 use groundhog::RollingTimer;
 use hal::interrupt;
 
@@ -49,6 +49,19 @@ fn main() -> ! {
 }
 
 
+
+unsafe impl Sync for DmaBox { }
+
+struct DmaBox {
+    ch1: UnsafeCell<MaybeUninit<C1>>,
+    buf: UnsafeCell<[u8; 256]>,
+}
+
+static DMA_BOX: DmaBox = DmaBox {
+    buf: UnsafeCell::new([0u8; 256]),
+    ch1: UnsafeCell::new(MaybeUninit::uninit()),
+};
+
 fn imain() -> Option<()> {
     let board = stm32::Peripherals::take()?;
     // let core = stm32::CorePeripherals::take()?;
@@ -64,7 +77,6 @@ fn imain() -> Option<()> {
     SPI1::reset(&mut rcc);
     GPIOA::enable(&mut rcc);
     GPIOB::enable(&mut rcc);
-
 
     let gpioa = board.GPIOA;
     let gpiob = board.GPIOB;
@@ -171,6 +183,13 @@ fn imain() -> Option<()> {
     let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
     spi1.cr1.modify(|_r, w| w.spe().enabled());
 
+    // DMA
+    let dma = board.DMA.split(&mut rcc, board.DMAMUX);
+    let ch1: C1 = dma.ch1;
+
+    unsafe { DMA_BOX.ch1.get().write(MaybeUninit::new(ch1)); }
+    // End DMA
+
     board.EXTI.exticr1.modify(|_r, w| {
         w.exti0_7().pb();
         w
@@ -266,6 +285,8 @@ fn EXTI0_1() {
 
     exti.rpr1.modify(|_r, w| w.rpif0().set_bit());
 
+    // TODO: Probably disable SPI via SPE, let main re-enable it
+
     match mode {
         MODE_SHORT_REG_READ => {
             // We have already sent the value, and we don't care about
@@ -284,12 +305,30 @@ fn EXTI0_1() {
 
             if let (Some(a), Some(b)) = (pop_byte(), pop_byte()) {
                 let val = u16::from_le_bytes([a, b]);
-                defmt::println!("Wrote {:04X} to {:?}", val, low);
+                // defmt::println!("Wrote {:04X} to {:?}", val, low);
                 REGS[low as usize].store(val, Ordering::Relaxed);
             }
         },
-        MODE_LONG_PKT_READ => defmt::unimplemented!(),
-        MODE_LONG_PKT_WRITE => defmt::unimplemented!(),
+        MODE_LONG_PKT_READ => {
+            spi1.cr2.modify(|_r, w| w.txdmaen().disabled());
+            let ch1 = unsafe { (*DMA_BOX.ch1.get()).assume_init_mut() };
+            let dma = unsafe { &*DMA::PTR };
+            let remain = dma.ch1().ndtr.read().ndt().bits();
+            defmt::println!("TX Remain: {:?}", remain);
+            ch1.disable();
+        },
+        MODE_LONG_PKT_WRITE => {
+            spi1.cr2.modify(|_r, w| w.rxdmaen().disabled());
+            let ch1 = unsafe { (*DMA_BOX.ch1.get()).assume_init_mut() };
+            let dma = unsafe { &*DMA::PTR };
+            let remain = dma.ch1().ndtr.read().ndt().bits();
+            let slice = unsafe { &*DMA_BOX.buf.get() };
+            slice.chunks(16).for_each(|c| {
+                defmt::println!("{:02X}", c);
+            });
+            defmt::println!("RX Remain: {:?}", remain);
+            ch1.disable();
+        },
         _ => {
             // Huh, that was weird.
         },
@@ -300,7 +339,6 @@ fn EXTI0_1() {
     }
 
     // TODO: Drain TX FIFO?
-    defmt::println!("BING BOOM");
     SPI_MODE.store(MODE_RELOAD, Ordering::Relaxed);
     set_not_busy();
 }
@@ -343,8 +381,39 @@ fn SPI1() {
             // Nothing else to do, just wait for EXTI.
             SPI_MODE.store(fbyte, Ordering::Relaxed);
         },
-        MODE_LONG_PKT_READ => defmt::unimplemented!(),
-        MODE_LONG_PKT_WRITE => defmt::unimplemented!(),
+        MODE_LONG_PKT_READ => {
+            // Write len
+            unsafe {
+                dr16b.write_volatile(256);
+            };
+
+            let ch1 = unsafe { (*DMA_BOX.ch1.get()).assume_init_mut() };
+
+            ch1.set_word_size(WordSize::BITS8);
+            ch1.set_memory_address(DMA_BOX.buf.get() as usize as u32, true);
+            ch1.set_peripheral_address(dr8b as usize as u32, false);
+            ch1.set_transfer_length(256);
+
+            ch1.set_direction(Direction::FromMemory);
+            ch1.select_peripheral(hal::dmamux::DmaMuxIndex::SPI1_TX);
+            ch1.enable();
+            spi1.cr2.modify(|_r, w| w.txdmaen().enabled());
+            SPI_MODE.store(MODE_LONG_PKT_READ, Ordering::Relaxed);
+        },
+        MODE_LONG_PKT_WRITE => {
+            let ch1 = unsafe { (*DMA_BOX.ch1.get()).assume_init_mut() };
+
+            ch1.set_word_size(WordSize::BITS8);
+            ch1.set_memory_address(DMA_BOX.buf.get() as usize as u32, true);
+            ch1.set_peripheral_address(dr8b as usize as u32, false);
+            ch1.set_transfer_length(256);
+
+            ch1.set_direction(Direction::FromPeripheral);
+            ch1.select_peripheral(hal::dmamux::DmaMuxIndex::SPI1_RX);
+            ch1.enable();
+            spi1.cr2.modify(|_r, w| w.rxdmaen().enabled());
+            SPI_MODE.store(MODE_LONG_PKT_WRITE, Ordering::Relaxed);
+        },
         _ => {
             // Nothing else to do, just wait for EXTI.
             SPI_MODE.store(MODE_INVALID_WAIT, Ordering::Relaxed);
