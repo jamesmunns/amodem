@@ -11,13 +11,19 @@ GPIOs (out) --------------------
 LED1: PB09 (also PC14)
 LED2: PC15
 IO1: PA11 (also PA09)
+    -> P1.01
 IO2: PA07
+    -> P1.02
 
 SPI1 ---------------------------
 SCLK: PA01
+    -> P1.04
 MOSI: PA02
+    -> P1.03
 MISO: PA06
+    -> P1.05
 CSn:  PB00 (also PB01,02, PA08)
+    -> P1.06
 
 Bitbang I2C --------------------
 PA05: SDA (BB)
