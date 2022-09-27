@@ -10,7 +10,7 @@ use amodem::{self as _, GlobalRollingTimer}; // global logger + panicking-behavi
 use cortex_m::peripheral::NVIC;
 use rand_chacha::{ChaCha8Rng, rand_core::{SeedableRng, RngCore}};
 use stm32g0xx_hal as hal;
-use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB, DMA}, exti::{ExtiExt, Event}, dma::{DmaExt, C1, Channel, WordSize, Direction}};
+use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB, DMA, USART1}, exti::{ExtiExt, Event}, dma::{DmaExt, C1, Channel, WordSize, Direction}};
 use groundhog::RollingTimer;
 use hal::interrupt;
 
@@ -75,21 +75,23 @@ fn imain() -> Option<()> {
 
     SPI1::enable(&mut rcc);
     SPI1::reset(&mut rcc);
+    USART1::enable(&mut rcc);
     GPIOA::enable(&mut rcc);
     GPIOB::enable(&mut rcc);
 
     let gpioa = board.GPIOA;
     let gpiob = board.GPIOB;
     let spi1 = board.SPI1;
+    let usart1 = board.USART1;
 
     GlobalRollingTimer::init(board.TIM2);
     let timer = GlobalRollingTimer::new();
 
 
     // USART1 -------------------------
-    // RXD: PB07 (also PB08)
-    // TXD: PB06 (also PB03,04,05)
-    // DE:  PA12 (also PA10)
+    // RXD: PB07 (also PB08)        - USART1RX          - AF0
+    // TXD: PB06 (also PB03,04,05)  - USART1TX          - AF0
+    // DE:  PA12 (also PA10)        - USART1_RTS_DE_CK  - AF1
 
 
     // The configuration procedure is almost the same for master and slave.
@@ -112,30 +114,32 @@ fn imain() -> Option<()> {
         w
     });
     gpioa.afrh.modify(|_r, w| {
-        w.afsel12(); // DE
+        w.afsel12().af1(); // DE
         w
     });
     gpiob.afrl.modify(|_r, w| {
-        w.afsel0().af0();
+        w.afsel0().af0(); // CSn
+        w.afsel6().af0(); // TXD
+        w.afsel7().af0(); // RXD
         w
     });
     gpioa.moder.modify(|_r, w| {
-        w.moder1().alternate(); // SCLK
-        w.moder2().alternate(); // MOSI
-        w.moder6().alternate(); // MISO
-        w.moder7().output();    // IO
-        w.moder12().output();   // DE
+        w.moder1().alternate();  // SCLK
+        w.moder2().alternate();  // MOSI
+        w.moder6().alternate();  // MISO
+        w.moder7().output();     // IO
+        w.moder12().alternate(); // DE
+        // w.moder12().output(); // DE
         w
     });
     gpiob.moder.modify(|_r, w| {
-        w.moder0().alternate();
+        w.moder0().alternate(); // CSn
+        w.moder6().alternate(); // TXD
+        w.moder7().alternate(); // RXD
         w
     });
+    // gpioa.odr.modify(|_r, w| w.odr12().high());
 
-    gpioa.odr.modify(|_r, w| {
-        w.odr12().low();
-        w
-    });
     // 2. Write to the SPI_CR1 register:
     //     * XXX - Configure the serial clock baud rate using the BR[2:0] bits (Note: 4).
     //     * Configure the CPOL and CPHA bits combination to define one of the
@@ -196,87 +200,200 @@ fn imain() -> Option<()> {
     // * (Note 3) Step is not required in NSSP mode.
     // * (Note 4) The step is not required in slave mode except slave working at TI mode
 
-    let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
-    spi1.cr1.modify(|_r, w| w.spe().enabled());
 
-    // DMA
-    let dma = board.DMA.split(&mut rcc, board.DMAMUX);
-    let ch1: C1 = dma.ch1;
+    //                                                           //
+    // SPI MAIN
+    //                                                           //
 
-    unsafe { DMA_BOX.ch1.get().write(MaybeUninit::new(ch1)); }
-    // End DMA
+    // let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
+    // spi1.cr1.modify(|_r, w| w.spe().enabled());
 
-    board.EXTI.exticr1.modify(|_r, w| {
-        w.exti0_7().pb();
+    // // DMA
+    // let dma = board.DMA.split(&mut rcc, board.DMAMUX);
+    // let ch1: C1 = dma.ch1;
+
+    // unsafe { DMA_BOX.ch1.get().write(MaybeUninit::new(ch1)); }
+    // // End DMA
+
+    // board.EXTI.exticr1.modify(|_r, w| {
+    //     w.exti0_7().pb();
+    //     w
+    // });
+    // board.EXTI.listen(Event::GPIO0, hal::gpio::SignalEdge::Rising);
+
+    // // TODO: Interrupt priority
+    // //
+    // // I definitely want EXTI to be higher than SPI1, not sure wrt USART/DMA ints.
+
+    // // Enable EXTI int
+    unsafe {
+        // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
+        // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
+    }
+
+    // loop {
+    //     // Clear ERR flags
+    //     // ? TODO
+
+    //     // Push two dummy bytes
+    //     unsafe {
+    //         dr8b.write_volatile(0x12);
+    //         dr8b.write_volatile(0x34);
+    //     }
+
+    //     // Enable RXNE Int
+    //     spi1.cr2.modify(|_r, w| w.rxneie().not_masked());
+
+    //     // Clear Busy Flag
+    //     set_not_busy();
+
+    //     defmt::println!("Waiting!");
+
+    //     // WFI until EXTI
+    //     while SPI_MODE.load(Ordering::Relaxed) != MODE_RELOAD {
+    //         cortex_m::asm::nop();
+    //     }
+
+    //     defmt::println!("DONG");
+
+    //     // Cleanup? Handle things NOT in interrupt context?
+    //     SPI_MODE.store(MODE_IDLE, Ordering::Relaxed);
+    // }
+
+
+    //                                                           //
+    // RS485 MAIN
+    //                                                           //
+
+    usart1.cr1.modify(|_r, w| {
+        w.rxffie().disabled();
+        w.txfeie().disabled();
+        w.fifoen().enabled();
+        w.m1().m0();
+        w.eobie().disabled();
+        w.rtoie().disabled();
+        w.deat().variant(31); // assertion: one bit time. TODO: check xcvr timing
+        w.dedt().variant(31); // deassertn: one bit time. TODO: check xcvr timing
+        w.over8().oversampling8();
+        w.cmie().enabled();
+        w.mme().enabled();
+        w.m0().bit9();
+        w.wake().address();
+        w.pce().disabled();
+        // w.ps();
+        w.peie().disabled();
+        w.txeie().disabled(); // This is txfnfie
+        w.tcie().disabled();
+        w.rxneie().disabled(); // this is rxfneie
+        w.idleie().disabled();
+        w.te().enabled();
+        w.re().enabled();
+        w.uesm().disabled();
+        w.ue().disabled(); // We will enable this after config is done
         w
     });
-    board.EXTI.listen(Event::GPIO0, hal::gpio::SignalEdge::Rising);
 
-    // TODO: Interrupt priority
-    //
-    // I definitely want EXTI to be higher than SPI1, not sure wrt USART/DMA ints.
+    usart1.cr2.modify(|_r, w| {
+        w.add().variant(0x40); // TODO: variable address match
+        w.rtoen().disabled(); // TODO
+        // w.abrmod();
+        w.abren().disabled();
+        w.msbfirst().lsb();
+        w.datainv().positive();
+        w.txinv().standard();
+        w.rxinv().standard();
+        w.swap().standard();
+        w.linen().disabled();
+        w.stop().stop1();
+        w.clken().disabled();
+        // w.cpol();
+        // w.cpha();
+        // w.lbcl();
+        w.lbdie().disabled();
+        // w.lbdl();
+        w.addm7().bit7();
+        // w.dis_nss();
+        // w.slven();
+        w
+    });
 
-    // Enable EXTI int
-    unsafe {
-        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
-        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
-    }
+    usart1.cr3.modify(|_r, w| {
+        w.txftcfg();
+        w.rxftie().disabled();
+        w.rxftcfg();
+        w.tcbgtie().disabled();
+        w.txftie().disabled();
+        w.wufie().disabled();
+        // w.wus();
+        // w.scarcnt();
+        w.dep().high();
+        w.dem().enabled();
+        w.ddre().disabled();
+        w.ovrdis().disabled();
+        w.onebit().sample3();
+        w.ctsie().disabled();
+        w.ctse().disabled();
+        w.rtse().disabled();
+        w.dmat().disabled();
+        w.dmar().disabled();
+        w.scen().disabled();
+        w.nack().disabled();
+        w.hdsel().not_selected();
+        // w.irlp();
+        w.iren().disabled();
+        w.eie().disabled();
+        w
+    });
+
+    usart1.brr.modify(|_r, w| {
+        w.brr().variant(0x0010);
+        w
+    });
+
+    usart1.rtor.modify(|_r, w| {
+        w
+    });
+
+    usart1.cr1.modify(|_r, w| w.ue().enabled());
+
+    let start = timer.get_ticks();
+    while timer.millis_since(start) <= 100 {}
+
+    usart1.cr1.modify(|_r, w| {
+        w.te().enabled();
+        w.re().enabled();
+        w
+    });
 
     loop {
-        // Clear ERR flags
-        // ? TODO
+        defmt::println!("Write once...");
+        usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
+        usart1.tdr.write(|w| unsafe { w.bits(0x0069) });
 
-        // Push two dummy bytes
-        unsafe {
-            dr8b.write_volatile(0x12);
-            dr8b.write_volatile(0x34);
-        }
+        while usart1.isr.read().tc().bit_is_clear() { }
 
-        // Enable RXNE Int
-        spi1.cr2.modify(|_r, w| w.rxneie().not_masked());
+        defmt::println!("Write twice...");
+        usart1.tdr.write(|w| unsafe { w.bits(0x0154) });
+        usart1.tdr.write(|w| unsafe { w.bits(0x0044) });
 
-        // Clear Busy Flag
-        set_not_busy();
+        while usart1.isr.read().tc().bit_is_clear() { }
 
-        defmt::println!("Waiting!");
-
-        // WFI until EXTI
-        while SPI_MODE.load(Ordering::Relaxed) != MODE_RELOAD {
-            cortex_m::asm::nop();
-        }
-
-        defmt::println!("DONG");
-
-        // Cleanup? Handle things NOT in interrupt context?
-        SPI_MODE.store(MODE_IDLE, Ordering::Relaxed);
+        let start = timer.get_ticks();
+        while timer.millis_since(start) <= 1000 {}
     }
 
+    // defmt::println!("Waiting for data...");
+    // usart1.rqr.write(|w| w.mmrq().set_bit());
 
+    // use hal::pac::Interrupt::USART1
 
-
-
-
-    // let mut rx = [0xFF; 2];
-    // rx.iter_mut().for_each(|b| {
-    //     while spi1.sr.read().rxne().is_empty() { }
-    //     *b = unsafe { dr8b.read_volatile() };
-    // });
-
-
-    // while !board.EXTI.is_pending(Event::GPIO0, hal::gpio::SignalEdge::Rising) { }
-    // gpioa.odr.modify(|_r, w| w.odr7().low());
-    // defmt::println!("ding.");
-
-    // defmt::println!("Got data: {:?}", &rx);
-    // let sr = spi1.sr.read().bits();
-    // defmt::println!("SRC: {:04X}", sr);
-
-    // let start = timer.get_ticks();
-    // while timer.millis_since(start) < 100 { }
-
-    // // let x = stm32g0xx_hal::pac::Interrupt::EXTI0_1;
-
-    // Some(())
+    // loop {
+    //     if usart1.isr.read().rxne().bit_is_set() {
+    //         let data = usart1.rdr.read().rdr().bits();
+    //         defmt::println!("Got {:04X}", data);
+    //     }
+    // }
 }
 
 fn set_busy() {
@@ -287,6 +404,11 @@ fn set_busy() {
 fn set_not_busy() {
     let gpioa = unsafe { &*GPIOA::PTR };
     gpioa.odr.modify(|_r, w| w.odr7().low());
+}
+
+#[interrupt]
+fn USART1() {
+    defmt::panic!("USART DING");
 }
 
 #[interrupt]
