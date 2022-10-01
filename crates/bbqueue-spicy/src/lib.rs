@@ -103,7 +103,6 @@ mod bbbuffer;
 pub use bbbuffer::*;
 
 pub mod framed;
-mod vusize;
 
 use core::result::Result as CoreResult;
 

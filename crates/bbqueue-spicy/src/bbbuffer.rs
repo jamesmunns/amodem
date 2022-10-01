@@ -13,7 +13,7 @@ use core::{
     slice::from_raw_parts_mut,
     sync::atomic::{
         AtomicBool, AtomicUsize,
-        Ordering::{AcqRel, Acquire, Release},
+        Ordering::{Acquire, Release, Relaxed},
     },
 };
 #[derive(Debug)]
@@ -85,11 +85,13 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn try_split(&'a self) -> Result<(Producer<'a, N>, Consumer<'a, N>)> {
-        if atomic::swap(&self.already_split, true, AcqRel) {
+    pub unsafe fn try_split(&'a self) -> Result<(Producer<'a, N>, Consumer<'a, N>)> {
+        if self.already_split.load(Acquire) {
             return Err(Error::AlreadySplit);
         }
+        self.already_split.store(true, Release);
 
+        #[allow(unused_unsafe)]
         unsafe {
             // Explicitly zero the data to avoid undefined behavior.
             // This is required, because we hand out references to the buffers,
@@ -125,7 +127,7 @@ impl<'a, const N: usize> BBBuffer<N> {
     ///
     /// NOTE:  If the `thumbv6` feature is selected, this function takes a short critical
     /// section while splitting.
-    pub fn try_split_framed(&'a self) -> Result<(FrameProducer<'a, N>, FrameConsumer<'a, N>)> {
+    pub unsafe fn try_split_framed(&'a self) -> Result<(FrameProducer<'a, N>, FrameConsumer<'a, N>)> {
         let (producer, consumer) = self.try_split()?;
         Ok((FrameProducer { producer }, FrameConsumer { consumer }))
     }
@@ -348,9 +350,10 @@ impl<'a, const N: usize> Producer<'a, N> {
     pub fn grant_exact(&mut self, sz: usize) -> Result<GrantW<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
-        if atomic::swap(&inner.write_in_progress, true, AcqRel) {
+        if inner.write_in_progress.load(Acquire) {
             return Err(Error::GrantInProgress);
         }
+        inner.write_in_progress.store(true, Release);
 
         // Writer component. Must never write to `read`,
         // be careful writing to `load`
@@ -446,9 +449,10 @@ impl<'a, const N: usize> Producer<'a, N> {
     pub fn grant_max_remaining(&mut self, mut sz: usize) -> Result<GrantW<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
-        if atomic::swap(&inner.write_in_progress, true, AcqRel) {
+        if inner.write_in_progress.load(Acquire) {
             return Err(Error::GrantInProgress);
         }
+        inner.write_in_progress.store(true, Release);
 
         // Writer component. Must never write to `read`,
         // be careful writing to `load`
@@ -551,9 +555,10 @@ impl<'a, const N: usize> Consumer<'a, N> {
     pub fn read(&mut self) -> Result<GrantR<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
-        if atomic::swap(&inner.read_in_progress, true, AcqRel) {
+        if inner.read_in_progress.load(Acquire) {
             return Err(Error::GrantInProgress);
         }
+        inner.read_in_progress.store(true, Release);
 
         let write = inner.write.load(Acquire);
         let last = inner.last.load(Acquire);
@@ -603,9 +608,10 @@ impl<'a, const N: usize> Consumer<'a, N> {
     pub fn split_read(&mut self) -> Result<SplitGrantR<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
-        if atomic::swap(&inner.read_in_progress, true, AcqRel) {
+        if inner.read_in_progress.load(Acquire) {
             return Err(Error::GrantInProgress);
         }
+        inner.read_in_progress.store(true, Release);
 
         let write = inner.write.load(Acquire);
         let last = inner.last.load(Acquire);
@@ -809,7 +815,8 @@ impl<'a, const N: usize> GrantW<'a, N> {
         let used = min(len, used);
 
         let write = inner.write.load(Acquire);
-        atomic::fetch_sub(&inner.reserve, len - used, AcqRel);
+        let old = inner.reserve.load(Acquire);
+        inner.reserve.store(old.wrapping_sub(len - used), Release);
 
         let max = N;
         let last = inner.last.load(Acquire);
@@ -866,6 +873,7 @@ impl<'a, const N: usize> GrantR<'a, N> {
         forget(self);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn shrink(&mut self, len: usize) {
         let mut new_buf: &mut [u8] = &mut [];
         core::mem::swap(&mut self.buf, &mut new_buf);
@@ -944,7 +952,8 @@ impl<'a, const N: usize> GrantR<'a, N> {
         debug_assert!(used <= self.buf.len());
 
         // This should be fine, purely incrementing
-        let _ = atomic::fetch_add(&inner.read, used, Release);
+        let old = inner.read.load(Relaxed);
+        inner.read.store(old.wrapping_add(used), Release);
 
         inner.read_in_progress.store(false, Release);
     }
@@ -1029,7 +1038,8 @@ impl<'a, const N: usize> SplitGrantR<'a, N> {
 
         if used <= self.buf1.len() {
             // This should be fine, purely incrementing
-            let _ = atomic::fetch_add(&inner.read, used, Release);
+            let old = inner.read.load(Relaxed);
+            inner.read.store(old.wrapping_add(used), Release);
         } else {
             // Also release parts of the second buffer
             inner.read.store(used - self.buf1.len(), Release);
@@ -1092,61 +1102,5 @@ impl<'a, const N: usize> Deref for GrantR<'a, N> {
 impl<'a, const N: usize> DerefMut for GrantR<'a, N> {
     fn deref_mut(&mut self) -> &mut [u8] {
         self.buf
-    }
-}
-
-#[cfg(feature = "thumbv6")]
-mod atomic {
-    use core::sync::atomic::{
-        AtomicBool, AtomicUsize,
-        Ordering::{self, Acquire, Release},
-    };
-    use cortex_m::interrupt::free;
-
-    #[inline(always)]
-    pub fn fetch_add(atomic: &AtomicUsize, val: usize, _order: Ordering) -> usize {
-        free(|_| {
-            let prev = atomic.load(Acquire);
-            atomic.store(prev.wrapping_add(val), Release);
-            prev
-        })
-    }
-
-    #[inline(always)]
-    pub fn fetch_sub(atomic: &AtomicUsize, val: usize, _order: Ordering) -> usize {
-        free(|_| {
-            let prev = atomic.load(Acquire);
-            atomic.store(prev.wrapping_sub(val), Release);
-            prev
-        })
-    }
-
-    #[inline(always)]
-    pub fn swap(atomic: &AtomicBool, val: bool, _order: Ordering) -> bool {
-        free(|_| {
-            let prev = atomic.load(Acquire);
-            atomic.store(val, Release);
-            prev
-        })
-    }
-}
-
-#[cfg(not(feature = "thumbv6"))]
-mod atomic {
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    #[inline(always)]
-    pub fn fetch_add(atomic: &AtomicUsize, val: usize, order: Ordering) -> usize {
-        atomic.fetch_add(val, order)
-    }
-
-    #[inline(always)]
-    pub fn fetch_sub(atomic: &AtomicUsize, val: usize, order: Ordering) -> usize {
-        atomic.fetch_sub(val, order)
-    }
-
-    #[inline(always)]
-    pub fn swap(atomic: &AtomicBool, val: bool, order: Ordering) -> bool {
-        atomic.swap(val, order)
     }
 }

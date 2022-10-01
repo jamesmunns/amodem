@@ -1,5 +1,5 @@
 [package]
-name = "bbqueue"
+name = "bbqueue-spicy"
 version = "0.5.1"
 description = "A SPSC, lockless, no_std, thread safe, queue, based on BipBuffers"
 repository = "https://github.com/jamesmunns/bbqueue"
@@ -22,7 +22,6 @@ version = "0.3.0"
 optional = true
 
 [features]
-thumbv6 = ["cortex-m"]
 defmt_0_3 = ["defmt"]
 
 [package.metadata.docs.rs]
