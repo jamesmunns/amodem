@@ -92,7 +92,7 @@ impl<'a, const N: usize> FrameProducer<'a, N> {
     ///
     /// This size does not include the size of the frame header. The exact size
     /// of the frame can be set on `commit`.
-    pub fn grant(&mut self, max_sz: usize) -> Result<FrameGrantW<'a, N>> {
+    pub fn grant(&self, max_sz: usize) -> Result<FrameGrantW<'a, N>> {
         if max_sz > U16_MAX_USIZE {
             return Err(Error::InsufficientSize);
         }
@@ -109,10 +109,16 @@ pub struct FrameConsumer<'a, const N: usize> {
 
 impl<'a, const N: usize> FrameConsumer<'a, N> {
     /// Obtain the next available frame, if any
-    pub fn read(&mut self) -> Option<FrameGrantR<'a, N>> {
+    pub fn read(&self) -> Option<FrameGrantR<'a, N>> {
         // Get all available bytes. We never wrap a frame around,
         // so if a header is available, the whole frame will be.
-        let grant_r = self.consumer.read().ok()?;
+        let mut grant_r = self.consumer.read().ok()?;
+
+        let mut header_bytes = [0u8; 2];
+        header_bytes.copy_from_slice(&grant_r[..HDR_LEN]);
+        let frame_len = u16::from_le_bytes(header_bytes) as usize;
+        let total_len = HDR_LEN + frame_len;
+        grant_r.shrink(total_len);
 
         Some(FrameGrantR { grant_r })
     }

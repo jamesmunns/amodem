@@ -30,6 +30,9 @@ git = "https://github.com/sprocket-board/stm32g0xx-hal"
 branch = "balcony-project"
 features = ["stm32g030", "rt"]
 
+[dependencies.bbqueue-spicy]
+path = "../crates/bbqueue-spicy"
+
 [dev-dependencies]
 defmt-test = "0.3.0"
 

@@ -9,7 +9,6 @@ use core::{
     mem::{forget, transmute, MaybeUninit},
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    result::Result as CoreResult,
     slice::from_raw_parts_mut,
     sync::atomic::{
         AtomicBool, AtomicUsize,
@@ -46,9 +45,6 @@ pub struct BBBuffer<const N: usize> {
 
     /// Is there an active write grant?
     write_in_progress: AtomicBool,
-
-    /// Have we already split?
-    already_split: AtomicBool,
 }
 
 unsafe impl<const A: usize> Sync for BBBuffer<A> {}
@@ -85,145 +81,36 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub unsafe fn try_split(&'a self) -> Result<(Producer<'a, N>, Consumer<'a, N>)> {
-        if self.already_split.load(Acquire) {
-            return Err(Error::AlreadySplit);
-        }
-        self.already_split.store(true, Release);
-
-        #[allow(unused_unsafe)]
-        unsafe {
-            // Explicitly zero the data to avoid undefined behavior.
-            // This is required, because we hand out references to the buffers,
-            // which mean that creating them as references is technically UB for now
-            let mu_ptr = self.buf.get();
-            (*mu_ptr).as_mut_ptr().write_bytes(0u8, 1);
-
-            let nn1 = NonNull::new_unchecked(self as *const _ as *mut _);
-            let nn2 = NonNull::new_unchecked(self as *const _ as *mut _);
-
-            Ok((
-                Producer {
-                    bbq: nn1,
-                    pd: PhantomData,
-                },
-                Consumer {
-                    bbq: nn2,
-                    pd: PhantomData,
-                },
-            ))
-        }
+    pub unsafe fn init(&'a self) {
+        // Explicitly zero the data to avoid undefined behavior.
+        // This is required, because we hand out references to the buffers,
+        // which mean that creating them as references is technically UB for now
+        let mu_ptr = self.buf.get();
+        (*mu_ptr).as_mut_ptr().write_bytes(0u8, 1);
     }
 
-    /// Attempt to split the `BBBuffer` into `FrameConsumer` and `FrameProducer` halves
-    /// to gain access to the buffer. If buffer has already been split, an error
-    /// will be returned.
-    ///
-    /// NOTE: When splitting, the underlying buffer will be explicitly initialized
-    /// to zero. This may take a measurable amount of time, depending on the size
-    /// of the buffer. This is necessary to prevent undefined behavior. If the buffer
-    /// is placed at `static` scope within the `.bss` region, the explicit initialization
-    /// will be elided (as it is already performed as part of memory initialization)
-    ///
-    /// NOTE:  If the `thumbv6` feature is selected, this function takes a short critical
-    /// section while splitting.
-    pub unsafe fn try_split_framed(&'a self) -> Result<(FrameProducer<'a, N>, FrameConsumer<'a, N>)> {
-        let (producer, consumer) = self.try_split()?;
-        Ok((FrameProducer { producer }, FrameConsumer { consumer }))
+    /// .
+    #[inline(always)]
+    pub unsafe fn get_consumer(&'static self) -> Consumer<'static, N> {
+        Consumer { bbq: NonNull::from(self), pd: PhantomData }
     }
 
-    /// Attempt to release the Producer and Consumer
-    ///
-    /// This re-initializes the buffer so it may be split in a different mode at a later
-    /// time. There must be no read or write grants active, or an error will be returned.
-    ///
-    /// The `Producer` and `Consumer` must be from THIS `BBBuffer`, or an error will
-    /// be returned.
-    ///
-    /// ```rust
-    /// # // bbqueue test shim!
-    /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
-    ///
-    /// // Create and split a new buffer
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
-    /// let (prod, cons) = buffer.try_split().unwrap();
-    ///
-    /// // Not possible to split twice
-    /// assert!(buffer.try_split().is_err());
-    ///
-    /// // Release the producer and consumer
-    /// assert!(buffer.try_release(prod, cons).is_ok());
-    ///
-    /// // Split the buffer in framed mode
-    /// let (fprod, fcons) = buffer.try_split_framed().unwrap();
-    /// # // bbqueue test shim!
-    /// # }
-    /// #
-    /// # fn main() {
-    /// # #[cfg(not(feature = "thumbv6"))]
-    /// # bbqtest();
-    /// # }
-    /// ```
-    pub fn try_release(
-        &'a self,
-        prod: Producer<'a, N>,
-        cons: Consumer<'a, N>,
-    ) -> CoreResult<(), (Producer<'a, N>, Consumer<'a, N>)> {
-        // Note: Re-entrancy is not possible because we require ownership
-        // of the producer and consumer, which are not cloneable. We also
-        // can assume the buffer has been split, because
-
-        // Are these our producers and consumers?
-        let our_prod = prod.bbq.as_ptr() as *const Self == self;
-        let our_cons = cons.bbq.as_ptr() as *const Self == self;
-
-        if !(our_prod && our_cons) {
-            // Can't release, not our producer and consumer
-            return Err((prod, cons));
-        }
-
-        let wr_in_progress = self.write_in_progress.load(Acquire);
-        let rd_in_progress = self.read_in_progress.load(Acquire);
-
-        if wr_in_progress || rd_in_progress {
-            // Can't release, active grant(s) in progress
-            return Err((prod, cons));
-        }
-
-        // Drop the producer and consumer halves
-        drop(prod);
-        drop(cons);
-
-        // Re-initialize the buffer (not totally needed, but nice to do)
-        self.write.store(0, Release);
-        self.read.store(0, Release);
-        self.reserve.store(0, Release);
-        self.last.store(0, Release);
-
-        // Mark the buffer as ready to be split
-        self.already_split.store(false, Release);
-
-        Ok(())
+    /// .
+    #[inline(always)]
+    pub unsafe fn get_producer(&'static self) -> Producer<'static, N> {
+        Producer { bbq: NonNull::from(self), pd: PhantomData }
     }
 
-    /// Attempt to release the Producer and Consumer in Framed mode
-    ///
-    /// This re-initializes the buffer so it may be split in a different mode at a later
-    /// time. There must be no read or write grants active, or an error will be returned.
-    ///
-    /// The `FrameProducer` and `FrameConsumer` must be from THIS `BBBuffer`, or an error
-    /// will be returned.
-    pub fn try_release_framed(
-        &'a self,
-        prod: FrameProducer<'a, N>,
-        cons: FrameConsumer<'a, N>,
-    ) -> CoreResult<(), (FrameProducer<'a, N>, FrameConsumer<'a, N>)> {
-        self.try_release(prod.producer, cons.consumer)
-            .map_err(|(producer, consumer)| {
-                // Restore the wrapper types
-                (FrameProducer { producer }, FrameConsumer { consumer })
-            })
+    /// .
+    #[inline(always)]
+    pub unsafe fn get_framed_consumer(&'static self) -> FrameConsumer<'static, N> {
+        FrameConsumer { consumer: self.get_consumer() }
+    }
+
+    /// .
+    #[inline(always)]
+    pub unsafe fn get_framed_producer(&'static self) -> FrameProducer<'static, N> {
+        FrameProducer { producer: self.get_producer() }
     }
 }
 
@@ -276,9 +163,6 @@ impl<const A: usize> BBBuffer<A> {
 
             /// Owned by the Writer, "private"
             write_in_progress: AtomicBool::new(false),
-
-            /// We haven't split at the start
-            already_split: AtomicBool::new(false),
         }
     }
 }
@@ -347,7 +231,7 @@ impl<'a, const N: usize> Producer<'a, N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn grant_exact(&mut self, sz: usize) -> Result<GrantW<'a, N>> {
+    pub fn grant_exact(&self, sz: usize) -> Result<GrantW<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
         if inner.write_in_progress.load(Acquire) {
@@ -446,7 +330,7 @@ impl<'a, const N: usize> Producer<'a, N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn grant_max_remaining(&mut self, mut sz: usize) -> Result<GrantW<'a, N>> {
+    pub fn grant_max_remaining(&self, mut sz: usize) -> Result<GrantW<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
         if inner.write_in_progress.load(Acquire) {
@@ -552,7 +436,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn read(&mut self) -> Result<GrantR<'a, N>> {
+    pub fn read(&self) -> Result<GrantR<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
         if inner.read_in_progress.load(Acquire) {
@@ -605,7 +489,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
 
     /// Obtains two disjoint slices, which are each contiguous of committed bytes.
     /// Combined these contain all previously commited data.
-    pub fn split_read(&mut self) -> Result<SplitGrantR<'a, N>> {
+    pub fn split_read(&self) -> Result<SplitGrantR<'a, N>> {
         let inner = unsafe { &self.bbq.as_ref() };
 
         if inner.read_in_progress.load(Acquire) {
@@ -873,7 +757,6 @@ impl<'a, const N: usize> GrantR<'a, N> {
         forget(self);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn shrink(&mut self, len: usize) {
         let mut new_buf: &mut [u8] = &mut [];
         core::mem::swap(&mut self.buf, &mut new_buf);
