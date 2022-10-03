@@ -2,7 +2,7 @@ use core::{cell::UnsafeCell, sync::atomic::{AtomicU8, Ordering}, mem::MaybeUnini
 use bbqueue_spicy::{BBBuffer, framed::{FrameGrantR, FrameGrantW}};
 use stm32g0xx_hal::{dma::{C1, C2, C3, C4, DmaExt, Channel, WordSize, Direction}, rcc::Rcc, pac::{DMA, DMAMUX, SPI1}, dmamux::DmaMuxIndex};
 
-use super::gpios;
+use super::{gpios, spi::spi_int_unmask};
 
 pub static PIPES: DataPipes = DataPipes {
     spi_to_rs485: Pipe::new(),
@@ -206,6 +206,8 @@ impl DataPipes {
         let spi1 = unsafe { &*SPI1::PTR };
         let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
 
+        let mut did_restore_spi = false;
+
         // rs485 read grant (outgoing)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_rd() {
             // setup rs485 transmit dma, enable interrupt
@@ -225,6 +227,7 @@ impl DataPipes {
 
             rs485_tx.set_direction(Direction::FromMemory);
             rs485_tx.select_peripheral(DmaMuxIndex::USART1_TX);
+            did_restore_spi = true;
         }
         // spi write grant (incoming)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_wr() {
@@ -242,6 +245,11 @@ impl DataPipes {
             spi_rx.select_peripheral(DmaMuxIndex::SPI1_RX);
 
             gpios::set_rxrdy_active();
+            did_restore_spi = true;
+        }
+        if did_restore_spi {
+            defmt::println!("unmasked spi int!");
+            spi_int_unmask();
         }
 
         // SPI read grant (outgoing)

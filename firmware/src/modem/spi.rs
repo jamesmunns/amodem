@@ -146,7 +146,7 @@ pub fn exti_isr() {
     }
 
     // TODO: Drain TX FIFO?
-    SPI_MODE.store(MODE_RELOAD, Ordering::Relaxed);
+    SPI_MODE.store(MODE_IDLE, Ordering::Relaxed);
 }
 
 #[inline]
@@ -162,7 +162,7 @@ pub fn spi_isr() {
     // defmt::assert!(!spi1.sr.read().rxne().is_empty());
     let mode = SPI_MODE.load(Ordering::Relaxed);
     if mode != MODE_IDLE {
-        return;
+        defmt::panic!("Not idle?");
     }
 
     // Read first FIFO byte
@@ -191,17 +191,21 @@ pub fn spi_isr() {
             unsafe {
                 dr16b.write_volatile(tx_amt as u16);
             };
-            let rx_amt = unsafe { pipes::PIPES.spi_to_rs485.get_prep_wr_dma() };
+            // This is the measuring point for "did we get a response back in time"
+            // v
+            // X
+            // ^
+            let rx_amt = unsafe { pipes::PIPES.spi_to_rs485.get_prep_wr_dma() }; // START
 
             if tx_amt != 0 {
                 spi1.cr2.modify(|_r, w| w.txdmaen().enabled());
                 unsafe { pipes::PIPES.trigger_spi_tx_dma() };
-                gpios::set_rxrdy_inactive();
+                gpios::set_txrdy_inactive();
             }
             if rx_amt != 0 {
                 spi1.cr2.modify(|_r, w| w.rxdmaen().enabled());
                 unsafe { pipes::PIPES.trigger_spi_rx_dma() };
-                gpios::set_txrdy_inactive();
+                gpios::set_rxrdy_inactive();                                     // END - 108 cycles: TODO look at this
             }
 
             SPI_MODE.store(MODE_LONG_PKT_READWRITE, Ordering::Relaxed);
