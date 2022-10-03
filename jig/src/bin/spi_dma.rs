@@ -75,7 +75,7 @@ fn imain() -> Option<()> {
     // const MODE_SHORT_REG_WRITE: u8 = 0b100_00000;
     // const MODE_INVALID_WAIT: u8 = 0b111_00000;
 
-    let mut bufout = [0x44u8; 257];
+    let mut bufout = [0x44u8; 128];
 
     // Read
     {

@@ -8,11 +8,12 @@ use amodem::{
         setup_sys_clocks,
         setup_rolling_timer,
         gpios::setup_gpios,
-        spi::setup_spi,
+        spi::{setup_spi, spi_int_unmask, exti_isr, spi_isr},
         pipes::PIPES
     },
 };
 
+use cortex_m::peripheral::NVIC;
 use stm32g0xx_hal as hal;
 use hal::stm32;
 use hal::interrupt;
@@ -43,6 +44,14 @@ fn imain() -> Option<()> {
         PIPES.init(&mut rcc, board.DMA, board.DMAMUX);
     }
 
+    // Actually enable the SPI interrupt
+    spi_int_unmask();
+
+    unsafe {
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
+    }
+
     loop {
         PIPES.idle_step();
     }
@@ -51,12 +60,12 @@ fn imain() -> Option<()> {
 
 #[interrupt]
 fn EXTI0_1() {
-    todo!("EXTI INTERRUPT!");
+    exti_isr();
 }
 
 #[interrupt]
 fn SPI1() {
-    todo!("SPI1 INTERRUPT");
+    spi_isr();
 }
 
 #[interrupt]

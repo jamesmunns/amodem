@@ -206,7 +206,7 @@ impl DataPipes {
         let spi1 = unsafe { &*SPI1::PTR };
         let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
 
-        // rs485 read grant (tx)
+        // rs485 read grant (outgoing)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_rd() {
             // setup rs485 transmit dma, enable interrupt
             defmt::println!("Reloaded RS485 Read Grant (outgoing)");
@@ -226,7 +226,7 @@ impl DataPipes {
             rs485_tx.set_direction(Direction::FromMemory);
             rs485_tx.select_peripheral(DmaMuxIndex::USART1_TX);
         }
-        // spi write grant (rx)
+        // spi write grant (incoming)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_wr() {
             // setup spi receive dma, enable interrupt
             // mark "ready to receive spi" IO
@@ -244,10 +244,29 @@ impl DataPipes {
             gpios::set_rxrdy_active();
         }
 
-        // rs485 write grant (rx)
+        // SPI read grant (outgoing)
         if let Some((ptr, len)) = self.rs485_to_spi.service_lowprio_rd() {
             // setup spi transmit dma, enable interrupt
             // mark "ready to send spi" IO
+            defmt::println!("Reloaded SPI Read Grant (outgoing)");
+
+
+            let spi_tx: &mut C2 = unsafe { (*self.spi_tx.get()).assume_init_mut() };
+
+            spi_tx.set_word_size(WordSize::BITS8);
+            spi_tx.set_memory_address(ptr as usize as u32, true);
+            spi_tx.set_peripheral_address(dr8b as usize as u32, false);
+            spi_tx.set_transfer_length(len as u16);
+
+            spi_tx.set_direction(Direction::FromMemory);
+            spi_tx.select_peripheral(DmaMuxIndex::SPI1_TX);
+
+            gpios::set_txrdy_active();
+        }
+
+        // RS485 Write Grant (incoming)
+        if let Some((ptr, len)) = self.rs485_to_spi.service_lowprio_wr() {
+            // setup rs485 receive dma, enable interrupt
             defmt::println!("Reloaded RS485 Write Grant (incoming)");
 
             let rs485_rx: &mut C3 = unsafe { (*self.rs485_rx.get()).assume_init_mut() };
@@ -264,24 +283,6 @@ impl DataPipes {
 
             rs485_rx.set_direction(Direction::FromPeripheral);
             rs485_rx.select_peripheral(DmaMuxIndex::USART1_RX);
-        }
-
-        // spi read grant (tx)
-        if let Some((ptr, len)) = self.rs485_to_spi.service_lowprio_wr() {
-            // setup rs485 receive dma, enable interrupt
-            defmt::println!("Reloaded SPI Read Grant (outgoing)");
-
-            let spi_tx: &mut C2 = unsafe { (*self.spi_tx.get()).assume_init_mut() };
-
-            spi_tx.set_word_size(WordSize::BITS8);
-            spi_tx.set_memory_address(ptr as usize as u32, true);
-            spi_tx.set_peripheral_address(dr8b as usize as u32, false);
-            spi_tx.set_transfer_length(len as u16);
-
-            spi_tx.set_direction(Direction::FromMemory);
-            spi_tx.select_peripheral(DmaMuxIndex::SPI1_TX);
-
-            gpios::set_txrdy_active();
         }
     }
 }

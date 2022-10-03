@@ -5,7 +5,7 @@
 
 use core::{sync::atomic::{AtomicU8, AtomicU16, Ordering}, cell::UnsafeCell, mem::MaybeUninit};
 
-use amodem::{self as _, GlobalRollingTimer, modem::{setup_sys_clocks, setup_rolling_timer, spi::{setup_spi, spi_dr_u8}, gpios::setup_gpios}}; // global logger + panicking-behavior + memory layout
+use amodem::{self as _, GlobalRollingTimer}; // global logger + panicking-behavior + memory layout
 
 use cortex_m::peripheral::NVIC;
 use rand_chacha::{ChaCha8Rng, rand_core::{SeedableRng, RngCore}};
@@ -67,14 +67,22 @@ fn imain() -> Option<()> {
     // let core = stm32::CorePeripherals::take()?;
 
     // Configure clocks
-    let mut rcc = setup_sys_clocks(board.RCC);
-    setup_rolling_timer(board.TIM2);
-    setup_gpios(&mut rcc, board.GPIOA, board.GPIOB);
+    let config = Config::pll()
+        .pll_cfg(PllConfig::with_hsi(1, 8, 2))
+        .ahb_psc(Prescaler::NotDivided)
+        .apb_psc(Prescaler::NotDivided);
+    let mut rcc = board.RCC.freeze(config);
 
-    setup_spi(&mut rcc, board.SPI1);
+    SPI1::enable(&mut rcc);
+    SPI1::reset(&mut rcc);
+    GPIOA::enable(&mut rcc);
+    GPIOB::enable(&mut rcc);
 
+    let gpioa = board.GPIOA;
+    let gpiob = board.GPIOB;
+    let spi1 = board.SPI1;
 
-
+    GlobalRollingTimer::init(board.TIM2);
     let timer = GlobalRollingTimer::new();
 
 
@@ -97,7 +105,37 @@ fn imain() -> Option<()> {
     // CSn:  PB00 - AF0
     //
     // afrl/afrh + moder
+    gpioa.afrl.modify(|_r, w| {
+        w.afsel1().af0(); // SCLK
+        w.afsel2().af0(); // MOSI
+        w.afsel6().af0(); // MISO
+        w
+    });
+    gpioa.afrh.modify(|_r, w| {
+        w.afsel12(); // DE
+        w
+    });
+    gpiob.afrl.modify(|_r, w| {
+        w.afsel0().af0();
+        w
+    });
+    gpioa.moder.modify(|_r, w| {
+        w.moder1().alternate(); // SCLK
+        w.moder2().alternate(); // MOSI
+        w.moder6().alternate(); // MISO
+        w.moder7().output();    // IO
+        w.moder12().output();   // DE
+        w
+    });
+    gpiob.moder.modify(|_r, w| {
+        w.moder0().alternate();
+        w
+    });
 
+    gpioa.odr.modify(|_r, w| {
+        w.odr12().low();
+        w
+    });
     // 2. Write to the SPI_CR1 register:
     //     * XXX - Configure the serial clock baud rate using the BR[2:0] bits (Note: 4).
     //     * Configure the CPOL and CPHA bits combination to define one of the
@@ -107,7 +145,23 @@ fn imain() -> Option<()> {
     //     * Configure the CRCL and CRCEN bits if CRC is needed (while SCK clock signal is at idle state).
     //     * Configure SSM and SSI
     //     * Configure the MSTR bit (in multimaster NSS configuration, avoid conflict state on NSS if master is configured to prevent MODF error).
-
+    spi1.cr1.modify(|_r, w| {
+        w.bidimode().unidirectional();
+        // w.bidioe();
+        w.crcen().disabled();
+        // w.crcnext();
+        // w.crcl();
+        w.rxonly().full_duplex();
+        w.ssm().disabled();
+        // w.ssi();
+        w.lsbfirst().msbfirst();
+        // w.spe();
+        w.br().div2();
+        w.mstr().slave();
+        w.cpol().idle_low();
+        w.cpha().first_edge();
+        w
+    });
 
     // 3. Write to SPI_CR2 register:
     //     * Configure the DS[3:0] bits to select the data length for the transfer.
@@ -116,7 +170,21 @@ fn imain() -> Option<()> {
     //     * Set the NSSP bit if the NSS pulse mode between two data units is required (keep CHPA and TI bits cleared in NSSP mode).
     //     * Configure the FRXTH bit. The RXFIFO threshold must be aligned to the read access size for the SPIx_DR register.
     //     * Initialize LDMA_TX and LDMA_RX bits if DMA is used in packed mode.
-
+    spi1.cr2.modify(|_r, w| {
+        // w.ldma_tx();
+        // w.ldma_rx();
+        w.frxth().quarter(); // 8-bit
+        w.ds().eight_bit();
+        w.txeie().masked();
+        w.rxneie().masked();
+        w.errie().masked();
+        w.frf().motorola();
+        w.nssp().no_pulse();
+        w.ssoe().disabled();
+        w.txdmaen().disabled();
+        w.rxdmaen().disabled();
+        w
+    });
 
     // 4. Write to SPI_CRCPR register: Configure the CRC polynomial if needed.
     // 5. Write proper DMA registers: Configure DMA streams dedicated for SPI Tx and Rx in DMA registers if the DMA streams are used.
@@ -128,8 +196,8 @@ fn imain() -> Option<()> {
     // * (Note 3) Step is not required in NSSP mode.
     // * (Note 4) The step is not required in slave mode except slave working at TI mode
 
-    let dr8b: *mut u8 = spi_dr_u8();
-
+    let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
+    spi1.cr1.modify(|_r, w| w.spe().enabled());
 
     // DMA
     let dma = board.DMA.split(&mut rcc, board.DMAMUX);
@@ -165,8 +233,7 @@ fn imain() -> Option<()> {
         }
 
         // Enable RXNE Int
-        // TODO RESTOREME
-        // spi1.cr2.modify(|_r, w| w.rxneie().not_masked());
+        spi1.cr2.modify(|_r, w| w.rxneie().not_masked());
 
         // Clear Busy Flag
         set_not_busy();

@@ -68,6 +68,11 @@ pub fn setup_spi(
     spi1.cr1.modify(|_r, w| w.spe().enabled());
 }
 
+pub fn spi_int_unmask() {
+    let spi1 = unsafe { &*SPI1::PTR };
+    spi1.cr2.modify(|_r, w| w.rxneie().not_masked());
+}
+
 #[inline]
 pub fn spi_dr_u8() -> *mut u8 {
     let spi1 = unsafe { &*SPI1::PTR };
