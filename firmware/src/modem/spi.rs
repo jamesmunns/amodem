@@ -1,8 +1,8 @@
-use core::{sync::atomic::{AtomicU8, Ordering, AtomicU16}, cell::UnsafeCell, mem::MaybeUninit};
+use core::sync::atomic::{AtomicU8, Ordering, AtomicU16};
 
-use stm32g0xx_hal::{rcc::{Rcc, Enable, Reset}, pac::SPI1, dma::{C1, C2, Channel, WordSize, Direction}, dmamux::DmaMuxIndex};
+use stm32g0xx_hal::{rcc::{Rcc, Enable, Reset}, pac::{SPI1, EXTI, DMA}};
 
-use super::pipes;
+use super::{pipes, gpios};
 
 static SPI_MODE: AtomicU8 = AtomicU8::new(MODE_IDLE);
 const MODE_IDLE: u8 = 0b000_00000;
@@ -22,25 +22,11 @@ const MODE_INVALID_WAIT: u8 = 0b111_00000;
 const ONE_ATOMIC: AtomicU16 = AtomicU16::new(0xACAB);
 static REGS: [AtomicU16; 32] = [ONE_ATOMIC; 32];
 
-unsafe impl Sync for DmaBox { }
-
-struct DmaBox {
-    ch1: UnsafeCell<MaybeUninit<C1>>,
-    ch2: UnsafeCell<MaybeUninit<C2>>,
-}
-
-static DMA_BOX: DmaBox = DmaBox {
-    ch1: UnsafeCell::new(MaybeUninit::uninit()),
-    ch2: UnsafeCell::new(MaybeUninit::uninit()),
-};
-
 
 #[inline]
 pub fn setup_spi(
     rcc: &mut Rcc,
     spi1: SPI1,
-    tx_dma: C1,
-    rx_dma: C2,
 ) {
     SPI1::enable(rcc);
     SPI1::reset(rcc);
@@ -90,6 +76,75 @@ pub fn spi_dr_u8() -> *mut u8 {
 }
 
 #[inline]
+pub fn exti_isr() {
+    let val = SPI_MODE.load(Ordering::Relaxed);
+    let mode = val & MODE_MASK;
+    let low = val & !MODE_MASK;
+
+    let exti = unsafe { &*EXTI::PTR };
+    let spi1 = unsafe { &*SPI1::PTR };
+    let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
+
+    exti.rpr1.modify(|_r, w| w.rpif0().set_bit());
+
+    // TODO: Probably disable SPI via SPE, let main re-enable it
+
+    match mode {
+        MODE_SHORT_REG_READ => {
+            // We have already sent the value, and we don't care about
+            // the data sent to us here. The FIFO will be drained below.
+        },
+        MODE_SHORT_REG_WRITE => {
+            // We need to get the next two bytes out of the FIFO to store to the
+            // proper register.
+            let pop_byte = || {
+                if !spi1.sr.read().rxne().is_empty() {
+                    Some(unsafe { dr8b.read_volatile() })
+                } else {
+                    None
+                }
+            };
+
+            if let (Some(a), Some(b)) = (pop_byte(), pop_byte()) {
+                let val = u16::from_le_bytes([a, b]);
+                // defmt::println!("Wrote {:04X} to {:?}", val, low);
+                REGS[low as usize].store(val, Ordering::Relaxed);
+            }
+        },
+        MODE_LONG_PKT_READWRITE => {
+            spi1.cr2.modify(|_r, w| {
+                w.txdmaen().disabled();
+                w.rxdmaen().disabled();
+                w
+            });
+            unsafe {
+                pipes::PIPES.spi_to_rs485.complete_wr_dma(|| {
+                    let dma = &*DMA::PTR;
+                    let remain = dma.ch1().ndtr.read().ndt().bits();
+                    remain as usize
+                });
+                pipes::PIPES.rs485_to_spi.complete_rd_dma();
+            }
+            unsafe {
+                pipes::PIPES.disable_spi_rx_dma();
+                pipes::PIPES.disable_spi_tx_dma();
+            }
+
+        },
+        _ => {
+            // Huh, that was weird.
+        },
+    }
+
+    while !spi1.sr.read().rxne().is_empty() {
+        let _ = unsafe { dr8b.read_volatile() };
+    }
+
+    // TODO: Drain TX FIFO?
+    SPI_MODE.store(MODE_RELOAD, Ordering::Relaxed);
+}
+
+#[inline]
 pub fn spi_isr() {
 
     let spi1 = unsafe { &*SPI1::PTR };
@@ -127,43 +182,25 @@ pub fn spi_isr() {
         },
         MODE_LONG_PKT_READWRITE => {
             // Write len
-            let tx_gr = pipes::PIPES.rs485_to_spi.get_rd_dma();
-            let tx_amt = match tx_gr {
-                Some((_, len)) => len,
-                None => 0
-            };
+            let tx_amt = unsafe { pipes::PIPES.rs485_to_spi.get_prep_rd_dma() };
             unsafe {
                 dr16b.write_volatile(tx_amt as u16);
             };
+            let rx_amt = unsafe { pipes::PIPES.spi_to_rs485.get_prep_wr_dma() };
 
-            let ch1: &mut C1 = unsafe { (*DMA_BOX.ch1.get()).assume_init_mut() };
-            let ch2: &mut C2 = unsafe { (*DMA_BOX.ch2.get()).assume_init_mut() };
+            if tx_amt != 0 {
+                spi1.cr2.modify(|_r, w| w.txdmaen().enabled());
+                unsafe { pipes::PIPES.trigger_spi_tx_dma() };
+                gpios::set_rxrdy_inactive();
+            }
+            if rx_amt != 0 {
+                spi1.cr2.modify(|_r, w| w.rxdmaen().enabled());
+                unsafe { pipes::PIPES.trigger_spi_rx_dma() };
+                gpios::set_txrdy_inactive();
+            }
 
-            ch1.set_word_size(WordSize::BITS8);
-            ch1.set_memory_address(DMA_BOX.buf.get() as usize as u32, true);
-            ch1.set_peripheral_address(dr8b as usize as u32, false);
-            ch1.set_transfer_length(256);
-
-            ch1.set_direction(Direction::FromMemory);
-            ch1.select_peripheral(DmaMuxIndex::SPI1_TX);
-            ch1.enable();
-            spi1.cr2.modify(|_r, w| w.txdmaen().enabled());
-            SPI_MODE.store(MODE_LONG_PKT_READ, Ordering::Relaxed);
+            SPI_MODE.store(MODE_LONG_PKT_READWRITE, Ordering::Relaxed);
         },
-        // MODE_LONG_PKT_WRITE => {
-        //     let ch1: C1 = unsafe { (*DMA_BOX.ch1.get()).assume_init_mut() };
-
-        //     ch1.set_word_size(WordSize::BITS8);
-        //     ch1.set_memory_address(DMA_BOX.buf.get() as usize as u32, true);
-        //     ch1.set_peripheral_address(dr8b as usize as u32, false);
-        //     ch1.set_transfer_length(256);
-
-        //     ch1.set_direction(Direction::FromPeripheral);
-        //     ch1.select_peripheral(DmaMuxIndex::SPI1_RX);
-        //     ch1.enable();
-        //     spi1.cr2.modify(|_r, w| w.rxdmaen().enabled());
-        //     SPI_MODE.store(MODE_LONG_PKT_WRITE, Ordering::Relaxed);
-        // },
         _ => {
             // Nothing else to do, just wait for EXTI.
             SPI_MODE.store(MODE_INVALID_WAIT, Ordering::Relaxed);
