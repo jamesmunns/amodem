@@ -1,6 +1,6 @@
 use core::{cell::UnsafeCell, sync::atomic::{AtomicU8, Ordering}, mem::MaybeUninit};
 use bbqueue_spicy::{BBBuffer, framed::{FrameGrantR, FrameGrantW}};
-use stm32g0xx_hal::{dma::{C1, C2, C3, C4, DmaExt, Channel, WordSize, Direction}, rcc::Rcc, pac::{DMA, DMAMUX, SPI1}, dmamux::DmaMuxIndex};
+use stm32g0xx_hal::{dma::{C1, C2, C3, C4, DmaExt, Channel, WordSize, Direction}, rcc::Rcc, pac::{DMA, DMAMUX, SPI1, USART1}, dmamux::DmaMuxIndex};
 
 use crate::modem::rs485::enable_rs485_addr_match;
 
@@ -207,7 +207,10 @@ impl DataPipes {
 
     pub fn idle_step(&'static self) {
         let spi1 = unsafe { &*SPI1::PTR };
-        let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
+        let spi_dr8b: *mut u8 = spi1.dr.as_ptr().cast();
+        let usart1 = unsafe { &*USART1::PTR };
+        let usart_tx_dr8b: *mut u8 = usart1.tdr.as_ptr().cast();
+        let usart_rx_dr8b: *mut u8 = usart1.rdr.as_ptr().cast();
 
         let mut did_restore_spi = false;
         let mut did_restore_rs485 = false;
@@ -215,7 +218,7 @@ impl DataPipes {
         // rs485 read grant (outgoing)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_rd() {
             // setup rs485 transmit dma, enable interrupt
-            defmt::println!("Reloaded RS485 Read Grant (outgoing)");
+            defmt::println!("Reloaded RS485 Read Grant (outgoing) - {}", len);
 
             let rs485_tx: &mut C4 = unsafe { (*self.rs485_tx.get()).assume_init_mut() };
 
@@ -226,7 +229,7 @@ impl DataPipes {
             });
 
             rs485_tx.set_memory_address(ptr as usize as u32, true);
-            rs485_tx.set_peripheral_address(dr8b as usize as u32, false);
+            rs485_tx.set_peripheral_address(usart_tx_dr8b as usize as u32, false);
             rs485_tx.set_transfer_length(len as u16);
 
             rs485_tx.set_direction(Direction::FromMemory);
@@ -242,7 +245,7 @@ impl DataPipes {
 
             spi_rx.set_word_size(WordSize::BITS8);
             spi_rx.set_memory_address(ptr as usize as u32, true);
-            spi_rx.set_peripheral_address(dr8b as usize as u32, false);
+            spi_rx.set_peripheral_address(spi_dr8b as usize as u32, false);
             spi_rx.set_transfer_length(len as u16);
 
             spi_rx.set_direction(Direction::FromPeripheral);
@@ -264,7 +267,7 @@ impl DataPipes {
 
             spi_tx.set_word_size(WordSize::BITS8);
             spi_tx.set_memory_address(ptr as usize as u32, true);
-            spi_tx.set_peripheral_address(dr8b as usize as u32, false);
+            spi_tx.set_peripheral_address(spi_dr8b as usize as u32, false);
             spi_tx.set_transfer_length(len as u16);
 
             spi_tx.set_direction(Direction::FromMemory);
@@ -288,7 +291,7 @@ impl DataPipes {
             });
 
             rs485_rx.set_memory_address(ptr as usize as u32, true);
-            rs485_rx.set_peripheral_address(dr8b as usize as u32, false);
+            rs485_rx.set_peripheral_address(usart_rx_dr8b as usize as u32, false);
             rs485_rx.set_transfer_length(len as u16);
 
             rs485_rx.set_direction(Direction::FromPeripheral);

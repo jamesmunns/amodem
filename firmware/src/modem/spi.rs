@@ -5,13 +5,11 @@ use stm32g0xx_hal::{rcc::{Rcc, Enable, Reset}, pac::{SPI1, EXTI, DMA}};
 use super::{pipes, gpios};
 
 static SPI_MODE: AtomicU8 = AtomicU8::new(MODE_IDLE);
-const MODE_IDLE: u8 = 0b000_00000;
-const MODE_RELOAD: u8 = 0b000_00001;
 
 // TODO: This should probably be an enum or something. Be careful when updating.
 //
 const MODE_MASK: u8 = 0b111_00000;
-
+const MODE_IDLE: u8 = 0b000_00000;
 const MODE_LONG_PKT_READWRITE: u8 = 0b001_00000;
 const MODE_SHORT_REG_READ: u8 = 0b011_00000;
 const MODE_SHORT_REG_WRITE: u8 = 0b100_00000;
@@ -83,6 +81,7 @@ pub fn spi_dr_u8() -> *mut u8 {
 #[inline]
 pub fn exti_isr() {
     let val = SPI_MODE.load(Ordering::Relaxed);
+
     let mode = val & MODE_MASK;
     let low = val & !MODE_MASK;
 
@@ -91,6 +90,11 @@ pub fn exti_isr() {
     let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
 
     exti.rpr1.modify(|_r, w| w.rpif0().set_bit());
+
+    if val == MODE_IDLE {
+        defmt::println!("Spurious EXTI?");
+        return;
+    }
 
     // TODO: Probably disable SPI via SPE, let main re-enable it
 
@@ -159,7 +163,6 @@ pub fn spi_isr() {
     // Disable RXNE interrupt
     spi1.cr2.modify(|_r, w| w.rxneie().masked());
 
-    // defmt::assert!(!spi1.sr.read().rxne().is_empty());
     let mode = SPI_MODE.load(Ordering::Relaxed);
     if mode != MODE_IDLE {
         defmt::panic!("Not idle?");

@@ -89,4 +89,4 @@ overflow-checks = false # <-
 [patch.crates-io.stm32g0]
 # path = "./vendor/stm32g0"
 git = "https://github.com/sprocket-board/stm32-rs-nightlies"
-rev = "ccef3a2a7b4184a61707da87b182d621d5fe830a"
+rev = "59b84d0dd4984b87b41e0fdf048bdfaa605c18b6"

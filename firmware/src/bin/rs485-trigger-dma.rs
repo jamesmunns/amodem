@@ -3,14 +3,14 @@
 
 #![allow(unused_imports)]
 
-use core::{sync::atomic::{AtomicU8, AtomicU16, Ordering}, cell::UnsafeCell, mem::MaybeUninit};
+use core::{sync::atomic::{AtomicU8, AtomicU16, Ordering, compiler_fence}, cell::UnsafeCell, mem::MaybeUninit};
 
 use amodem::{self as _, GlobalRollingTimer}; // global logger + panicking-behavior + memory layout
 
 use cortex_m::peripheral::NVIC;
 use rand_chacha::{ChaCha8Rng, rand_core::{SeedableRng, RngCore}};
 use stm32g0xx_hal as hal;
-use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB, DMA, USART1}, exti::{ExtiExt, Event}, dma::{DmaExt, C1, Channel, WordSize, Direction}};
+use hal::{stm32, rcc::{Config, PllConfig, Prescaler, RccExt, Enable, Reset}, gpio::GpioExt, spi::{Spi, NoSck, NoMiso}, time::RateExtU32, analog::adc::AdcExt, pac::{SPI1, GPIOA, GPIOB, DMA, USART1}, exti::{ExtiExt, Event}, dma::{DmaExt, C1, Channel, WordSize, Direction}, dmamux::DmaMuxIndex};
 use groundhog::RollingTimer;
 use hal::interrupt;
 
@@ -335,7 +335,7 @@ fn imain() -> Option<()> {
         w.ctsie().disabled();
         w.ctse().disabled();
         w.rtse().disabled();
-        w.dmat().disabled();
+        w.dmat().enabled();
         w.dmar().disabled();
         w.scen().disabled();
         w.nack().disabled();
@@ -365,18 +365,43 @@ fn imain() -> Option<()> {
         w.re().enabled();
         w
     });
+    // defmt::panic!("dmat {}", usart1.cr3.read().dmat().bit_is_set());
+
+    let mut buf = [0u16; 3];
+    buf.copy_from_slice(&[4, 5, 6]);
+
+    let addr = (&board.DMA.ch[1]) as *const _ as usize;
+    defmt::println!("{:08X}", addr);
+
+    let dma = board.DMA.split(&mut rcc, board.DMAMUX);
+
+    let mut ch4 = dma.ch4;
+    let usart_tx_dr8b: *mut u8 = usart1.tdr.as_ptr().cast();
+    ch4.set_word_size(WordSize::BITS16);
+    ch4.set_memory_address(buf.as_ptr() as usize as u32, true);
+    ch4.set_peripheral_address(usart_tx_dr8b as usize as u32, false);
+    ch4.set_transfer_length(3);
+    ch4.set_direction(Direction::FromMemory);
+    ch4.select_peripheral(DmaMuxIndex::USART1_TX);
+
+    compiler_fence(Ordering::SeqCst);
+
+
 
     defmt::println!("Write once...");
-    for _ in 0..1 {
-        usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
+    ch4.enable();
+    let start = timer.get_ticks();
+    while timer.micros_since(start) <= 1000 {}
+    // for _ in 0..1 {
+    //     usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
 
-        let len = 512u16;
-        let lenb = len.to_le_bytes();
-        lenb.iter().for_each(|b| usart1.tdr.write(|w| w.tdr().bits((*b) as u16)));
-        while usart1.isr.read().tc().bit_is_clear() { }
-        let start = timer.get_ticks();
-        while timer.micros_since(start) <= 1000 {}
-    }
+    //     let len = 512u16;
+    //     let lenb = len.to_le_bytes();
+    //     lenb.iter().for_each(|b| usart1.tdr.write(|w| w.tdr().bits((*b) as u16)));
+    //     while usart1.isr.read().tc().bit_is_clear() { }
+    //     let start = timer.get_ticks();
+    //     while timer.micros_since(start) <= 1000 {}
+    // }
 
     // let start = timer.get_ticks();
     // while timer.ticks_since(start) <= 20 {}
