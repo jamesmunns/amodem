@@ -11,7 +11,7 @@ use amodem::{
         setup_rolling_timer,
         gpios::setup_gpios,
         spi::{setup_spi, spi_int_unmask, exti_isr, spi_isr},
-        pipes::PIPES, rs485::setup_rs485
+        pipes::{PIPES, self}, rs485::setup_rs485
     }, GlobalRollingTimer,
 };
 
@@ -81,7 +81,7 @@ static ONESHOT: AtomicBool = AtomicBool::new(false);
 #[interrupt]
 fn USART1() {
     let usart1 = unsafe { &*USART1::PTR };
-    defmt::println!("ISR: {:08X}", usart1.isr.read().bits());
+    defmt::println!("INTENTRY");
 
     // if !ONESHOT.load(Ordering::Relaxed) {
     //     while usart1.isr.read().rxne().bit_is_set() {
@@ -94,11 +94,17 @@ fn USART1() {
     // }
 
     let rdr16b: *mut u16 = usart1.rdr.as_ptr().cast();
-    loop {
-        if usart1.isr.read().rxne().bit_is_set() {
-            let data = unsafe { rdr16b.read_volatile() };
-            defmt::println!("INT - Got {:04X}", data);
-        }
+    while usart1.isr.read().rxne().bit_is_set() {
+        let data = unsafe { rdr16b.read_volatile() };
+        defmt::println!("INT - Got {:04X}", data);
     }
-    todo!("USART1 INTERRUPT");
+    usart1.icr.write(|w| w.cmcf().set_bit());
+    usart1.cr1.modify(|_r, w| w.cmie().disabled());
+
+    unsafe {
+        pipes::PIPES.rs485_to_spi.get_prep_wr_dma();
+        pipes::PIPES.rs485_to_spi.complete_wr_dma(|_len| {
+            0
+        });
+    }
 }

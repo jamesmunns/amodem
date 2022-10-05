@@ -123,10 +123,10 @@ pub fn exti_isr() {
                 w
             });
             unsafe {
-                pipes::PIPES.spi_to_rs485.complete_wr_dma(|| {
+                pipes::PIPES.spi_to_rs485.complete_wr_dma(|len| {
                     let dma = &*DMA::PTR;
                     let remain = dma.ch1().ndtr.read().ndt().bits();
-                    remain as usize
+                    len.saturating_sub(remain as usize)
                 });
                 pipes::PIPES.rs485_to_spi.complete_rd_dma();
             }

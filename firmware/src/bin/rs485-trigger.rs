@@ -367,23 +367,34 @@ fn imain() -> Option<()> {
     });
 
     defmt::println!("Write once...");
-    usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
+    for _ in 0..3 {
+        usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
+        usart1.tdr.write(|w| unsafe { w.bits(0x0023) });
+        usart1.tdr.write(|w| unsafe { w.bits(0x0045) });
+        while usart1.isr.read().tc().bit_is_clear() { }
+        let start = timer.get_ticks();
+        while timer.micros_since(start) <= 1000 {}
+    }
+
+    // let start = timer.get_ticks();
+    // while timer.ticks_since(start) <= 20 {}
+
     // while usart1.isr.read().tc().bit_is_clear() { }
     // let start = timer.get_ticks();
     // while timer.ticks_since(start) <= 20 {}
 
-    usart1.tdr.write(|w| unsafe { w.bits(0x0023) });
-    // while usart1.isr.read().tc().bit_is_clear() { }
-    // let start = timer.get_ticks();
-    // while timer.ticks_since(start) <= 20 {}
-
-    usart1.tdr.write(|w| unsafe { w.bits(0x0045) });
     // while usart1.isr.read().tc().bit_is_clear() { }
     // let start = timer.get_ticks();
     // while timer.ticks_since(start) <= 20 {}
 
     let start = timer.get_ticks();
-    while timer.millis_since(start) <= 1000 {}
+    while timer.millis_since(start) <= 100 {}
+
+    defmt::println!("Write twice...");
+    usart1.tdr.write(|w| unsafe { w.bits(0x0139) });
+    usart1.tdr.write(|w| unsafe { w.bits(0x0023) });
+    usart1.tdr.write(|w| unsafe { w.bits(0x0045) });
+    while usart1.isr.read().tc().bit_is_clear() { }
 
     defmt::println!("DONE!");
 

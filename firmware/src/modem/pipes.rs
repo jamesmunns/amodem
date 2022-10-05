@@ -109,13 +109,14 @@ impl Pipe {
     }
 
     #[inline]
-    pub unsafe fn complete_wr_dma<F: FnOnce() -> usize>(&'static self, f: F) {
+    pub unsafe fn complete_wr_dma<F: FnOnce(usize) -> usize>(&'static self, f: F) {
         if self.wr_state.load(Ordering::Relaxed) == Self::STATE_GRANT_BUSY {
-            let used = f();
             let mu_ptr = self.wr_grant.get();
             let mut garbo = MaybeUninit::zeroed();
             core::ptr::swap(mu_ptr, &mut garbo);
-            garbo.assume_init().commit(used);
+            let grant = garbo.assume_init();
+            let used = f(grant.len());
+            grant.commit(used);
             self.wr_state.store(Self::STATE_IDLE, Ordering::Relaxed);
         }
     }
