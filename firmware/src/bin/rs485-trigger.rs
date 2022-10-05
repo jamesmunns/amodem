@@ -229,7 +229,7 @@ fn imain() -> Option<()> {
     unsafe {
         // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
         // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
-        // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
     }
 
     // loop {
@@ -366,36 +366,40 @@ fn imain() -> Option<()> {
         w
     });
 
-    // loop {
-    //     defmt::println!("Write once...");
-    //     usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
-    //     usart1.tdr.write(|w| unsafe { w.bits(0x0069) });
+    defmt::println!("Write once...");
+    usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
+    // while usart1.isr.read().tc().bit_is_clear() { }
+    // let start = timer.get_ticks();
+    // while timer.ticks_since(start) <= 20 {}
 
-    //     while usart1.isr.read().tc().bit_is_clear() { }
+    usart1.tdr.write(|w| unsafe { w.bits(0x0023) });
+    // while usart1.isr.read().tc().bit_is_clear() { }
+    // let start = timer.get_ticks();
+    // while timer.ticks_since(start) <= 20 {}
 
-    //     defmt::println!("Write twice...");
-    //     usart1.tdr.write(|w| unsafe { w.bits(0x0154) });
-    //     usart1.tdr.write(|w| unsafe { w.bits(0x0044) });
+    usart1.tdr.write(|w| unsafe { w.bits(0x0045) });
+    // while usart1.isr.read().tc().bit_is_clear() { }
+    // let start = timer.get_ticks();
+    // while timer.ticks_since(start) <= 20 {}
 
-    //     while usart1.isr.read().tc().bit_is_clear() { }
+    let start = timer.get_ticks();
+    while timer.millis_since(start) <= 1000 {}
 
-    //     let start = timer.get_ticks();
-    //     while timer.millis_since(start) <= 1000 {}
-    // }
+    defmt::println!("DONE!");
 
-    defmt::println!("Waiting for data...");
-    usart1.rqr.write(|w| w.mmrq().set_bit());
+    Some(())
+
+    // defmt::println!("Waiting for data...");
+    // usart1.rqr.write(|w| w.mmrq().set_bit());
 
     // use hal::pac::Interrupt::USART1
 
-    let rdr16b: *mut u16 = usart1.rdr.as_ptr().cast();
-
-    loop {
-        if usart1.isr.read().rxne().bit_is_set() {
-            let data = unsafe { rdr16b.read_volatile() };
-            defmt::println!("Got {:04X}", data);
-        }
-    }
+    // loop {
+    //     if usart1.isr.read().rxne().bit_is_set() {
+    //         let data = usart1.rdr.read().rdr().bits();
+    //         defmt::println!("Got {:04X}", data);
+    //     }
+    // }
 }
 
 fn set_busy() {

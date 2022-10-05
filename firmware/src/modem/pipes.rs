@@ -2,6 +2,8 @@ use core::{cell::UnsafeCell, sync::atomic::{AtomicU8, Ordering}, mem::MaybeUnini
 use bbqueue_spicy::{BBBuffer, framed::{FrameGrantR, FrameGrantW}};
 use stm32g0xx_hal::{dma::{C1, C2, C3, C4, DmaExt, Channel, WordSize, Direction}, rcc::Rcc, pac::{DMA, DMAMUX, SPI1}, dmamux::DmaMuxIndex};
 
+use crate::modem::rs485::enable_rs485_addr_match;
+
 use super::{gpios, spi::spi_int_unmask};
 
 pub static PIPES: DataPipes = DataPipes {
@@ -207,6 +209,7 @@ impl DataPipes {
         let dr8b: *mut u8 = spi1.dr.as_ptr().cast();
 
         let mut did_restore_spi = false;
+        let mut did_restore_rs485 = false;
 
         // rs485 read grant (outgoing)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_rd() {
@@ -227,7 +230,7 @@ impl DataPipes {
 
             rs485_tx.set_direction(Direction::FromMemory);
             rs485_tx.select_peripheral(DmaMuxIndex::USART1_TX);
-            did_restore_spi = true;
+            did_restore_rs485 = true;
         }
         // spi write grant (incoming)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_wr() {
@@ -247,10 +250,7 @@ impl DataPipes {
             gpios::set_rxrdy_active();
             did_restore_spi = true;
         }
-        if did_restore_spi {
-            defmt::println!("unmasked spi int!");
-            spi_int_unmask();
-        }
+
 
         // SPI read grant (outgoing)
         if let Some((ptr, len)) = self.rs485_to_spi.service_lowprio_rd() {
@@ -270,6 +270,7 @@ impl DataPipes {
             spi_tx.select_peripheral(DmaMuxIndex::SPI1_TX);
 
             gpios::set_txrdy_active();
+            did_restore_spi = true;
         }
 
         // RS485 Write Grant (incoming)
@@ -291,6 +292,17 @@ impl DataPipes {
 
             rs485_rx.set_direction(Direction::FromPeripheral);
             rs485_rx.select_peripheral(DmaMuxIndex::USART1_RX);
+            did_restore_rs485 = true;
+        }
+
+        if did_restore_spi {
+            defmt::println!("unmasked spi int!");
+            spi_int_unmask();
+        }
+
+        if did_restore_rs485 {
+            defmt::println!("unmasked rs485 int!");
+            enable_rs485_addr_match();
         }
     }
 }

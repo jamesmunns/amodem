@@ -62,11 +62,13 @@ pub fn setup_gpios(
         w.moder6().alternate(); // MISO
         w.moder7().output();    // IO2
         w.moder11().output();   // IO1
-        w.moder12().output();   // DE
+        w.moder12().alternate();   // DE
         w
     });
     gpiob.moder.modify(|_r, w| {
         w.moder0().alternate(); // CSn
+        w.moder6().alternate(); // TXD
+        w.moder7().alternate(); // RXD
         w
     });
 
