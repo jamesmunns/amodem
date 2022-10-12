@@ -1,10 +1,10 @@
 use core::{cell::UnsafeCell, sync::atomic::{AtomicU8, Ordering}, mem::MaybeUninit};
 use bbqueue_spicy::{BBBuffer, framed::{FrameGrantR, FrameGrantW}};
-use stm32g0xx_hal::{dma::{C1, C2, C3, C4, DmaExt, Channel, WordSize, Direction}, rcc::Rcc, pac::{DMA, DMAMUX, SPI1, USART1}, dmamux::DmaMuxIndex};
+use stm32g0xx_hal::{dma::{C1, C2, C3, C4, DmaExt, Channel, WordSize, Direction, Event}, rcc::Rcc, pac::{DMA, DMAMUX, SPI1, USART1}, dmamux::DmaMuxIndex};
 
 use crate::modem::rs485::enable_rs485_addr_match;
 
-use super::{gpios, spi::spi_int_unmask};
+use super::{gpios, spi::spi_int_unmask, rs485};
 
 pub static PIPES: DataPipes = DataPipes {
     spi_to_rs485: Pipe::new(),
@@ -171,7 +171,12 @@ impl DataPipes {
         self.spi_to_rs485.init();
         self.rs485_to_spi.init();
 
-        let dma = dma.split(rcc, dmamux);
+        let mut dma = dma.split(rcc, dmamux);
+
+        dma.ch1.disable();
+        dma.ch2.disable();
+        dma.ch3.disable();
+        dma.ch4.disable();
 
         self.spi_rx.get().write(MaybeUninit::new(dma.ch1));
         self.spi_tx.get().write(MaybeUninit::new(dma.ch2));
@@ -192,15 +197,21 @@ impl DataPipes {
     }
 
     #[inline]
-    pub unsafe fn trigger_rs485_rx_dma(&'static self) {
-        let rs485_rx: &mut C3 = (*self.rs485_rx.get()).assume_init_mut();
-        rs485_rx.enable();
+    pub unsafe fn trigger_rs485_tx_dma(&'static self) {
+        let rs485_tx: &mut C4 = (*self.rs485_tx.get()).assume_init_mut();
+        rs485_tx.clear_event(Event::TransferComplete);
+        rs485_tx.listen(Event::TransferComplete);
+        rs485_tx.enable();
+        rs485_tx.enable();
     }
 
     #[inline]
-    pub unsafe fn trigger_rs485_tx_dma(&'static self) {
-        let rs485_tx: &mut C4 = (*self.rs485_tx.get()).assume_init_mut();
-        rs485_tx.enable();
+    pub unsafe fn trigger_modified_rs485_rx_dma(&'static self, amt: u16) {
+        let rs485_rx: &mut C3 = (*self.rs485_rx.get()).assume_init_mut();
+        rs485_rx.set_transfer_length(amt);
+        rs485_rx.clear_event(Event::TransferComplete);
+        rs485_rx.listen(Event::TransferComplete);
+        rs485_rx.enable();
     }
 
     #[inline]
@@ -218,12 +229,16 @@ impl DataPipes {
     #[inline]
     pub unsafe fn disable_rs485_rx_dma(&'static self) {
         let rs485_rx: &mut C3 = (*self.rs485_rx.get()).assume_init_mut();
+        rs485_rx.clear_event(Event::TransferComplete);
+        rs485_rx.unlisten(Event::TransferComplete);
         rs485_rx.disable();
     }
 
     #[inline]
     pub unsafe fn disable_rs485_tx_dma(&'static self) {
         let rs485_tx: &mut C4 = (*self.rs485_tx.get()).assume_init_mut();
+        rs485_tx.clear_event(Event::TransferComplete);
+        rs485_tx.unlisten(Event::TransferComplete);
         rs485_tx.disable();
     }
 
@@ -237,27 +252,53 @@ impl DataPipes {
         let mut did_restore_spi = false;
         let mut did_restore_rs485 = false;
 
-        // rs485 read grant (outgoing)
-        if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_rd() {
-            // setup rs485 transmit dma, enable interrupt
-            defmt::println!("Reloaded RS485 Read Grant (outgoing) - {}", len);
+        if rs485::should_reload() {
+            // rs485 read grant (outgoing)
+            if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_rd() {
+                // setup rs485 transmit dma, enable interrupt
+                defmt::println!("Reloaded RS485 Read Grant (outgoing) - {}", len);
 
-            let rs485_tx: &mut C4 = unsafe { (*self.rs485_tx.get()).assume_init_mut() };
+                let rs485_tx: &mut C4 = unsafe { (*self.rs485_tx.get()).assume_init_mut() };
 
-            unsafe { &*DMA::PTR }.ch4().cr.modify(|_, w| {
-                w.psize().bits16();
-                w.msize().bits8();
-                w
-            });
+                unsafe { &*DMA::PTR }.ch4().cr.modify(|_, w| {
+                    w.psize().bits16();
+                    w.msize().bits8();
+                    w
+                });
 
-            rs485_tx.set_memory_address(ptr as usize as u32, true);
-            rs485_tx.set_peripheral_address(usart_tx_dr8b as usize as u32, false);
-            rs485_tx.set_transfer_length(len as u16);
+                rs485_tx.set_memory_address(ptr as usize as u32, true);
+                rs485_tx.set_peripheral_address(usart_tx_dr8b as usize as u32, false);
+                rs485_tx.set_transfer_length(len as u16);
 
-            rs485_tx.set_direction(Direction::FromMemory);
-            rs485_tx.select_peripheral(DmaMuxIndex::USART1_TX);
-            did_restore_rs485 = true;
+                rs485_tx.set_direction(Direction::FromMemory);
+                rs485_tx.select_peripheral(DmaMuxIndex::USART1_TX);
+                did_restore_rs485 = true;
+            }
+
+            // RS485 Write Grant (incoming)
+            if let Some((ptr, len)) = self.rs485_to_spi.service_lowprio_wr() {
+                // setup rs485 receive dma, enable interrupt
+                defmt::println!("Reloaded RS485 Write Grant (incoming)");
+
+                let rs485_rx: &mut C3 = unsafe { (*self.rs485_rx.get()).assume_init_mut() };
+
+                unsafe { &*DMA::PTR }.ch3().cr.modify(|_, w| {
+                    w.psize().bits16();
+                    w.msize().bits8();
+                    w
+                });
+
+                rs485_rx.set_memory_address(ptr as usize as u32, true);
+                rs485_rx.set_peripheral_address(usart_rx_dr8b as usize as u32, false);
+                rs485_rx.set_transfer_length(len as u16);
+
+                rs485_rx.set_direction(Direction::FromPeripheral);
+                rs485_rx.select_peripheral(DmaMuxIndex::USART1_RX);
+                did_restore_rs485 = true;
+            }
         }
+
+
         // spi write grant (incoming)
         if let Some((ptr, len)) = self.spi_to_rs485.service_lowprio_wr() {
             // setup spi receive dma, enable interrupt
@@ -297,28 +338,6 @@ impl DataPipes {
 
             gpios::set_txrdy_active();
             did_restore_spi = true;
-        }
-
-        // RS485 Write Grant (incoming)
-        if let Some((ptr, len)) = self.rs485_to_spi.service_lowprio_wr() {
-            // setup rs485 receive dma, enable interrupt
-            defmt::println!("Reloaded RS485 Write Grant (incoming)");
-
-            let rs485_rx: &mut C3 = unsafe { (*self.rs485_rx.get()).assume_init_mut() };
-
-            unsafe { &*DMA::PTR }.ch3().cr.modify(|_, w| {
-                w.psize().bits16();
-                w.msize().bits8();
-                w
-            });
-
-            rs485_rx.set_memory_address(ptr as usize as u32, true);
-            rs485_rx.set_peripheral_address(usart_rx_dr8b as usize as u32, false);
-            rs485_rx.set_transfer_length(len as u16);
-
-            rs485_rx.set_direction(Direction::FromPeripheral);
-            rs485_rx.select_peripheral(DmaMuxIndex::USART1_RX);
-            did_restore_rs485 = true;
         }
 
         if did_restore_spi {

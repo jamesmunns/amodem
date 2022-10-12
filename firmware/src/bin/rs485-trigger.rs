@@ -229,7 +229,7 @@ fn imain() -> Option<()> {
     unsafe {
         // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
         // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
-        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
+        // NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
     }
 
     // loop {
@@ -378,7 +378,12 @@ fn imain() -> Option<()> {
         lenb_txcap.iter().for_each(|b| usart1.tdr.write(|w| w.tdr().bits((*b) as u16)));
         while usart1.isr.read().tc().bit_is_clear() { }
         let start = timer.get_ticks();
-        while timer.micros_since(start) <= 1000 {}
+        while timer.micros_since(start) <= 600 {}
+        for _ in 0..64 {
+            usart1.tdr.write(|w| w.tdr().bits(0x00AF));
+            while usart1.isr.read().tc().bit_is_clear() { }
+        }
+        while timer.micros_since(start) <= 10_000 { }
     }
 
     // let start = timer.get_ticks();

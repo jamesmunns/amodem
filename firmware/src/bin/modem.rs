@@ -60,7 +60,11 @@ fn imain() -> Option<()> {
         NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
         NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
         NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::DMA_CHANNEL2_3);
+        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::DMA_CHANNEL4_5_6_7);
     }
+
+
 
     loop {
         PIPES.idle_step();
@@ -72,6 +76,21 @@ fn imain() -> Option<()> {
     }
 }
 
+#[interrupt]
+fn DMA_CHANNEL2_3() {
+    // Note: only channel 3 interrupts are used at the moment, for signalling
+    // rs-485 receive is complete
+    rs485_isr();
+    defmt::println!("DMA ISR 23")
+}
+
+#[interrupt]
+fn DMA_CHANNEL4_5_6_7() {
+    // Note: only channel 4 interrupts are used at the moment, for signalling
+    // rs-485 tx is complete
+    rs485_isr();
+    defmt::println!("DMA ISR 4567")
+}
 
 #[interrupt]
 fn EXTI0_1() {
@@ -88,31 +107,4 @@ static ONESHOT: AtomicBool = AtomicBool::new(false);
 #[interrupt]
 fn USART1() {
     rs485_isr();
-    // let usart1 = unsafe { &*USART1::PTR };
-    // defmt::println!("INTENTRY");
-
-    // // if !ONESHOT.load(Ordering::Relaxed) {
-    // //     while usart1.isr.read().rxne().bit_is_set() {
-    // //         let data = usart1.rdr.read().rdr().bits();
-    // //         defmt::println!("ISRFLUSH - Got {:04X}", data);
-    // //     }
-    // //     usart1.cr1.modify(|_r, w| w.rxneie().disabled());
-    // //     ONESHOT.store(true, Ordering::Relaxed);
-    // //     return;
-    // // }
-
-    // let rdr16b: *mut u16 = usart1.rdr.as_ptr().cast();
-    // while usart1.isr.read().rxne().bit_is_set() {
-    //     let data = unsafe { rdr16b.read_volatile() };
-    //     defmt::println!("INT - Got {:04X}", data);
-    // }
-    // usart1.icr.write(|w| w.cmcf().set_bit());
-    // usart1.cr1.modify(|_r, w| w.cmie().disabled());
-
-    // unsafe {
-    //     pipes::PIPES.rs485_to_spi.get_prep_wr_dma();
-    //     pipes::PIPES.rs485_to_spi.complete_wr_dma(|_len| {
-    //         0
-    //     });
-    // }
 }

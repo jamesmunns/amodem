@@ -738,6 +738,13 @@ impl<'a, const N: usize> GrantW<'a, N> {
     pub fn to_commit(&mut self, amt: usize) {
         self.to_commit = self.buf.len().min(amt);
     }
+
+    pub(crate) fn shrink(&mut self, len: usize) {
+        let mut new_buf: &mut [u8] = &mut [];
+        core::mem::swap(&mut self.buf, &mut new_buf);
+        let (new, _) = new_buf.split_at_mut(len);
+        self.buf = new;
+    }
 }
 
 impl<'a, const N: usize> GrantR<'a, N> {

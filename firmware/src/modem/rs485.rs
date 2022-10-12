@@ -121,28 +121,49 @@ pub fn setup_rs485(rcc: &mut Rcc, usart1: USART1) {
 
     defmt::println!("ISR: {:08X}", usart1.isr.read().bits());
 
-    MODE.store(MODE_IDLE, Ordering::Relaxed);
+    MODE.store(MODE_RELOAD, Ordering::Relaxed);
     RECV_AMT.store(0, Ordering::Relaxed);
 }
 
-pub fn enable_rs485_addr_match() {
-    let usart1 = unsafe { &*USART1::PTR };
-    let timer = GlobalRollingTimer::new();
-    let start = timer.get_ticks();
+pub fn should_reload() -> bool {
+    let mode = MODE.load(Ordering::Relaxed);
+    (mode == MODE_RELOAD) || (mode == MODE_READY)
+}
 
+pub fn enable_rs485_addr_match() {
+    let mode = MODE.load(Ordering::Relaxed);
+    let ok = (mode == MODE_RELOAD) || (mode == MODE_READY);
+    if !ok {
+        defmt::panic!("What");
+    }
+
+    let usart1 = unsafe { &*USART1::PTR };
+
+    usart1.icr.write(|w| w.cmcf().set_bit());
+    usart1.rqr.write(|w| w.mmrq().set_bit());
+
+    // Wait until the "is in mute mode" bit is set
+    while usart1.isr.read().rwu().bit_is_clear() { }
+    // Empty the FIFO
+    usart1.rqr.write(|w| w.rxfrq().set_bit());
+
+    MODE.store(MODE_READY, Ordering::Relaxed);
     usart1.cr1.modify(|_r, w| {
         w.cmie().enabled();
         w
     });
+    defmt::println!("RELOADED.");
 }
 
-static MODE: AtomicU8 = AtomicU8::new(MODE_IDLE);
+static MODE: AtomicU8 = AtomicU8::new(MODE_RELOAD);
 static RECV_AMT: AtomicU16 = AtomicU16::new(0);
 
-const MODE_IDLE: u8 = 0;
-const MODE_SEND_NO_DMA: u8 = 1;
-const MODE_SEND_DMA: u8 = 2;
-const MODE_RECV: u8 = 3;
+const MODE_RELOAD: u8 = 0;
+const MODE_READY: u8 = 1;
+const MODE_SEND_NO_DMA: u8 = 2;
+const MODE_SEND_DMA: u8 = 3;
+const MODE_RECV: u8 = 4;
+
 
 pub fn rs485_isr() {
     let mode = MODE.load(Ordering::Relaxed);
@@ -152,26 +173,63 @@ pub fn rs485_isr() {
         // do: Wait for (addr_u16, Rrx_cap, Rtx_cap), send (Mtx_len, Mrx_cap),
         //       start data tx (if any), enable TCIE
         // then: wait for tx complete
-        MODE_IDLE => idle_start(),
+        MODE_READY => idle_start(),
         MODE_SEND_DMA => dma_tx_complete(),
         MODE_SEND_NO_DMA => no_dma_tx_complete(),
         MODE_RECV => recv_complete(),
         // TX Done:
         // On:
-        _ => defmt::panic!(),
+        MODE_RELOAD | _ => defmt::panic!(),
     }
+
+    defmt::println!("MODE WAS: {}, MODE IS: {}", mode, MODE.load(Ordering::Relaxed));
 }
 
 fn recv_complete() {
-    defmt::panic!("recv_complete");
+    unsafe {
+        pipes::PIPES.disable_rs485_rx_dma();
+        pipes::PIPES.rs485_to_spi.complete_wr_dma(|_amt| {
+            RECV_AMT.load(Ordering::Relaxed) as usize
+        });
+    }
+
+    RECV_AMT.store(0, Ordering::Relaxed);
+    MODE.store(MODE_RELOAD, Ordering::Relaxed);
 }
 
 fn no_dma_tx_complete() {
-    defmt::panic!("no_dma_tx_complete");
+    let usart1 = unsafe { &*USART1::PTR };
+    usart1.cr1.modify(|_r, w| {
+        w.tcie().disabled();
+        w
+    });
+
+    start_recv()
 }
 
 fn dma_tx_complete() {
-    defmt::panic!("dma_tx_complete");
+    unsafe {
+        pipes::PIPES.disable_rs485_tx_dma();
+        pipes::PIPES.spi_to_rs485.complete_rd_dma();
+    }
+
+    start_recv()
+}
+
+fn start_recv() {
+    let rx_amt = RECV_AMT.load(Ordering::Relaxed);
+
+    if rx_amt == 0 {
+        MODE.store(MODE_RELOAD, Ordering::Relaxed);
+        return;
+    }
+    unsafe {
+        let usart1 = &*USART1::PTR;
+        usart1.cr3.modify(|_r, w| w.dmar().enabled());
+        pipes::PIPES.trigger_modified_rs485_rx_dma(rx_amt);
+    }
+    MODE.store(MODE_RECV, Ordering::Relaxed);
+    defmt::println!("TRIG {}", rx_amt);
 }
 
 // TODO: start some kind of timer for 1ms (?), if it hits,
@@ -193,7 +251,7 @@ fn idle_start() {
     let start = timer.get_ticks();
 
     // Clear character match flag
-    usart1.icr.write(|w| w.cmcf().set_bit());
+    usart1.cr1.modify(|_r, w| w.cmie().disabled());
 
     let tx_amt_cap = unsafe { pipes::PIPES.spi_to_rs485.get_prep_rd_dma() };
     let rx_amt_cap = unsafe { pipes::PIPES.rs485_to_spi.get_prep_wr_dma() };
@@ -212,13 +270,28 @@ fn idle_start() {
 
     // TODO: replace this with logging the timeout and
     // a req to return to mute mode
-    defmt::assert!(res.is_ok(), "TIMEOUT");
+    if !res.is_ok() {
+        defmt::println!("RS485 timeout!");
+        unsafe {
+            pipes::PIPES.spi_to_rs485.abort_rd_dma();
+            pipes::PIPES.rs485_to_spi.abort_wr_dma();
+        }
+        return;
+    }
 
     let len_rx = [rxbuf[1] as u8, rxbuf[2] as u8];
     let len_tx = [rxbuf[3] as u8, rxbuf[4] as u8];
     // TODO mix _len with tx_amt to determine actual amount to send
     let r_rx_cap = u16::from_le_bytes(len_rx);
     let r_tx_cap = u16::from_le_bytes(len_tx);
+
+    defmt::println!(
+        "{} {} {} {}",
+        r_rx_cap,
+        tx_amt_cap,
+        r_tx_cap,
+        rx_amt_cap,
+    );
 
     let tx_amt = if (r_rx_cap as usize) >= tx_amt_cap {
         // Router can hold what we're sending (including if we want to
@@ -234,7 +307,7 @@ fn idle_start() {
     let rx_amt = if (r_tx_cap as usize) <= rx_amt_cap {
         // We can hold what the router is sending (including if it wants
         // to send zero bytes)
-        rx_amt_cap
+        r_tx_cap
     } else {
         unsafe {
             pipes::PIPES.rs485_to_spi.abort_wr_dma();
@@ -249,12 +322,6 @@ fn idle_start() {
         usart1.tdr.write(|w| w.tdr().bits((*b) as u16));
     });
 
-    // Enable TX complete interrupt. ISR.TC is cleared on write to TDR.
-    usart1.cr1.modify(|_r, w| {
-        w.tcie().enabled();
-        w
-    });
-
     // Store amount to receive
     RECV_AMT.store(rx_amt as u16, Ordering::Relaxed);
 
@@ -266,6 +333,12 @@ fn idle_start() {
             pipes::PIPES.trigger_rs485_tx_dma();
         }
     } else {
+        // Enable TX complete interrupt. ISR.TC is cleared on write to TDR.
+        usart1.cr1.modify(|_r, w| {
+            w.tcie().enabled();
+            w
+        });
+
         MODE.store(MODE_SEND_NO_DMA, Ordering::Relaxed);
     }
 

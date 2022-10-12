@@ -205,6 +205,11 @@ impl<'a, const N: usize> FrameGrantW<'a, N> {
             self.grant_w.to_commit(size);
         }
     }
+
+    /// ...
+    pub fn shrink(&mut self, len: usize) {
+        self.grant_w.shrink(len + 2);
+    }
 }
 
 impl<'a, const N: usize> FrameGrantR<'a, N> {
