@@ -81,7 +81,7 @@ fn DMA_CHANNEL2_3() {
     // Note: only channel 3 interrupts are used at the moment, for signalling
     // rs-485 receive is complete
     rs485_isr();
-    defmt::println!("DMA ISR 23")
+    // defmt::println!("DMA ISR 23")
 }
 
 #[interrupt]
@@ -89,7 +89,7 @@ fn DMA_CHANNEL4_5_6_7() {
     // Note: only channel 4 interrupts are used at the moment, for signalling
     // rs-485 tx is complete
     rs485_isr();
-    defmt::println!("DMA ISR 4567")
+    // defmt::println!("DMA ISR 4567")
 }
 
 #[interrupt]

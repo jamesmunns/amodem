@@ -378,11 +378,16 @@ fn imain() -> Option<()> {
         lenb_txcap.iter().for_each(|b| usart1.tdr.write(|w| w.tdr().bits((*b) as u16)));
         while usart1.isr.read().tc().bit_is_clear() { }
         let start = timer.get_ticks();
-        while timer.micros_since(start) <= 600 {}
+        while timer.micros_since(start) <= 200 {}
         for _ in 0..64 {
             usart1.tdr.write(|w| w.tdr().bits(0x00AF));
             while usart1.isr.read().tc().bit_is_clear() { }
         }
+
+        // Force mute mode
+        usart1.tdr.write(|w| w.tdr().bits(0x01FF));
+        while usart1.isr.read().tc().bit_is_clear() { }
+
         while timer.micros_since(start) <= 10_000 { }
     }
 

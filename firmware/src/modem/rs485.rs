@@ -139,12 +139,14 @@ pub fn enable_rs485_addr_match() {
 
     let usart1 = unsafe { &*USART1::PTR };
 
-    usart1.icr.write(|w| w.cmcf().set_bit());
-    usart1.rqr.write(|w| w.mmrq().set_bit());
+    // defmt::println!("Mutin...");
 
-    // Wait until the "is in mute mode" bit is set
-    while usart1.isr.read().rwu().bit_is_clear() { }
-    // Empty the FIFO
+    usart1.icr.write(|w| w.cmcf().set_bit());
+    // usart1.rqr.write(|w| w.mmrq().set_bit());
+
+    // // Wait until the "is in mute mode" bit is set
+    // while usart1.isr.read().rwu().bit_is_clear() { }
+    // // Empty the FIFO
     usart1.rqr.write(|w| w.rxfrq().set_bit());
 
     MODE.store(MODE_READY, Ordering::Relaxed);
@@ -152,7 +154,6 @@ pub fn enable_rs485_addr_match() {
         w.cmie().enabled();
         w
     });
-    defmt::println!("RELOADED.");
 }
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_RELOAD);
@@ -182,7 +183,7 @@ pub fn rs485_isr() {
         MODE_RELOAD | _ => defmt::panic!(),
     }
 
-    defmt::println!("MODE WAS: {}, MODE IS: {}", mode, MODE.load(Ordering::Relaxed));
+    // defmt::println!("MODE WAS: {}, MODE IS: {}", mode, MODE.load(Ordering::Relaxed));
 }
 
 fn recv_complete() {
@@ -191,6 +192,8 @@ fn recv_complete() {
         pipes::PIPES.rs485_to_spi.complete_wr_dma(|_amt| {
             RECV_AMT.load(Ordering::Relaxed) as usize
         });
+        let usart1 = &*USART1::PTR;
+        usart1.cr3.modify(|_r, w| w.dmar().disabled());
     }
 
     RECV_AMT.store(0, Ordering::Relaxed);
@@ -208,6 +211,9 @@ fn no_dma_tx_complete() {
 }
 
 fn dma_tx_complete() {
+    let usart1 = unsafe { &*USART1::PTR };
+    usart1.cr3.modify(|_r, w| w.dmat().enabled());
+
     unsafe {
         pipes::PIPES.disable_rs485_tx_dma();
         pipes::PIPES.spi_to_rs485.complete_rd_dma();
@@ -229,7 +235,7 @@ fn start_recv() {
         pipes::PIPES.trigger_modified_rs485_rx_dma(rx_amt);
     }
     MODE.store(MODE_RECV, Ordering::Relaxed);
-    defmt::println!("TRIG {}", rx_amt);
+    // defmt::println!("TRIG {}", rx_amt);
 }
 
 // TODO: start some kind of timer for 1ms (?), if it hits,
@@ -285,13 +291,13 @@ fn idle_start() {
     let r_rx_cap = u16::from_le_bytes(len_rx);
     let r_tx_cap = u16::from_le_bytes(len_tx);
 
-    defmt::println!(
-        "{} {} {} {}",
-        r_rx_cap,
-        tx_amt_cap,
-        r_tx_cap,
-        rx_amt_cap,
-    );
+    // defmt::println!(
+    //     "{} {} {} {}",
+    //     r_rx_cap,
+    //     tx_amt_cap,
+    //     r_tx_cap,
+    //     rx_amt_cap,
+    // );
 
     let tx_amt = if (r_rx_cap as usize) >= tx_amt_cap {
         // Router can hold what we're sending (including if we want to
