@@ -370,9 +370,12 @@ fn imain() -> Option<()> {
     for _ in 0..1 {
         usart1.tdr.write(|w| unsafe { w.bits(0x0140) });
 
-        let len = 512u16;
-        let lenb = len.to_le_bytes();
-        lenb.iter().for_each(|b| usart1.tdr.write(|w| w.tdr().bits((*b) as u16)));
+        let len_rxcap = 512u16;
+        let lenb_rxcap = len_rxcap.to_le_bytes();
+        lenb_rxcap.iter().for_each(|b| usart1.tdr.write(|w| w.tdr().bits((*b) as u16)));
+        let len_txcap = 64u16;
+        let lenb_txcap = len_txcap.to_le_bytes();
+        lenb_txcap.iter().for_each(|b| usart1.tdr.write(|w| w.tdr().bits((*b) as u16)));
         while usart1.isr.read().tc().bit_is_clear() { }
         let start = timer.get_ticks();
         while timer.micros_since(start) <= 1000 {}

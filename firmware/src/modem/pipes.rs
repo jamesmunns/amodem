@@ -109,6 +109,28 @@ impl Pipe {
     }
 
     #[inline]
+    pub unsafe fn abort_wr_dma(&'static self) {
+        if self.wr_state.load(Ordering::Relaxed) == Self::STATE_GRANT_BUSY {
+            let mu_ptr = self.wr_grant.get();
+            let mut garbo = MaybeUninit::zeroed();
+            core::ptr::swap(mu_ptr, &mut garbo);
+            let _ = garbo.assume_init();
+            self.wr_state.store(Self::STATE_IDLE, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub unsafe fn abort_rd_dma(&'static self) {
+        if self.rd_state.load(Ordering::Relaxed) == Self::STATE_GRANT_BUSY {
+            let mu_ptr = self.rd_grant.get();
+            let mut garbo = MaybeUninit::zeroed();
+            core::ptr::swap(mu_ptr, &mut garbo);
+            let _ = garbo.assume_init();
+            self.rd_state.store(Self::STATE_IDLE, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
     pub unsafe fn complete_wr_dma<F: FnOnce(usize) -> usize>(&'static self, f: F) {
         if self.wr_state.load(Ordering::Relaxed) == Self::STATE_GRANT_BUSY {
             let mu_ptr = self.wr_grant.get();

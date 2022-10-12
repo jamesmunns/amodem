@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering, AtomicU16};
 
 use groundhog::RollingTimer;
 use stm32g0xx_hal::{rcc::{Rcc, Enable, Reset}, pac::USART1};
@@ -120,6 +120,9 @@ pub fn setup_rs485(rcc: &mut Rcc, usart1: USART1) {
     usart1.rqr.write(|w| w.rxfrq().set_bit());
 
     defmt::println!("ISR: {:08X}", usart1.isr.read().bits());
+
+    MODE.store(MODE_IDLE, Ordering::Relaxed);
+    RECV_AMT.store(0, Ordering::Relaxed);
 }
 
 pub fn enable_rs485_addr_match() {
@@ -134,34 +137,66 @@ pub fn enable_rs485_addr_match() {
 }
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_IDLE);
+static RECV_AMT: AtomicU16 = AtomicU16::new(0);
 
 const MODE_IDLE: u8 = 0;
-const MODE_TODO: u8 = 1;
+const MODE_SEND_NO_DMA: u8 = 1;
+const MODE_SEND_DMA: u8 = 2;
+const MODE_RECV: u8 = 3;
 
 pub fn rs485_isr() {
     let mode = MODE.load(Ordering::Relaxed);
     match mode {
+        // Idle:
+        // On: Addr match + data (RXNE)
+        // do: Wait for (addr_u16, Rrx_cap, Rtx_cap), send (Mtx_len, Mrx_cap),
+        //       start data tx (if any), enable TCIE
+        // then: wait for tx complete
         MODE_IDLE => idle_start(),
+        MODE_SEND_DMA => dma_tx_complete(),
+        MODE_SEND_NO_DMA => no_dma_tx_complete(),
+        MODE_RECV => recv_complete(),
+        // TX Done:
+        // On:
         _ => defmt::panic!(),
     }
 }
 
+fn recv_complete() {
+    defmt::panic!("recv_complete");
+}
+
+fn no_dma_tx_complete() {
+    defmt::panic!("no_dma_tx_complete");
+}
+
+fn dma_tx_complete() {
+    defmt::panic!("dma_tx_complete");
+}
+
+// TODO: start some kind of timer for 1ms (?), if it hits,
+// abort current cycle, log error. If we hit the end of cycle
+// before that, defuse.
+
 fn idle_start() {
-    // Blocking wait for three words.
+    // Blocking wait for five words.
     //
     // Since we were interrupted AFTER the first word arrived, it should take
-    // 22 bit periods, or 2.75uS to complete this processing. Since that is only
-    // 176 cycles, don't waste time waiting for another interrupt. SPI can still
+    // 44 bit periods, or 5.50uS to complete this processing. Since that is only
+    // (2 * 176) cycles, don't waste time waiting for another interrupt. SPI can still
     // interrupt us.
     //
-    // Set a timeout for 5uS to prevent deadlock.
+    // Set a timeout for 8uS to prevent deadlock.
     let usart1 = unsafe { &*USART1::PTR };
-    let mut rxbuf = [0u16; 3];
+    let mut rxbuf = [0u16; 5];
     let timer = GlobalRollingTimer::new();
     let start = timer.get_ticks();
 
-    let tx_amt = unsafe { pipes::PIPES.spi_to_rs485.get_prep_rd_dma() };
-    let rx_amt = unsafe { pipes::PIPES.rs485_to_spi.get_prep_wr_dma() };
+    // Clear character match flag
+    usart1.icr.write(|w| w.cmcf().set_bit());
+
+    let tx_amt_cap = unsafe { pipes::PIPES.spi_to_rs485.get_prep_rd_dma() };
+    let rx_amt_cap = unsafe { pipes::PIPES.rs485_to_spi.get_prep_wr_dma() };
 
     let res = rxbuf.iter_mut().try_for_each(|b| {
         loop {
@@ -169,32 +204,70 @@ fn idle_start() {
                 *b = usart1.rdr.read().rdr().bits();
                 return Ok(());
             }
-            if timer.micros_since(start) >= 5 {
+            if timer.micros_since(start) >= 8 {
                 return Err(());
             }
         }
     });
+
+    // TODO: replace this with logging the timeout and
+    // a req to return to mute mode
     defmt::assert!(res.is_ok(), "TIMEOUT");
-    defmt::assert_ne!(tx_amt, 0, "NONE?");
 
-    let len = [rxbuf[1] as u8, rxbuf[2] as u8];
+    let len_rx = [rxbuf[1] as u8, rxbuf[2] as u8];
+    let len_tx = [rxbuf[3] as u8, rxbuf[4] as u8];
     // TODO mix _len with tx_amt to determine actual amount to send
-    let _len = u16::from_le_bytes(len);
+    let r_rx_cap = u16::from_le_bytes(len_rx);
+    let r_tx_cap = u16::from_le_bytes(len_tx);
 
-    let txb = (tx_amt as u16).to_le_bytes();
-    let rxb = (rx_amt as u16).to_le_bytes();
+    let tx_amt = if (r_rx_cap as usize) >= tx_amt_cap {
+        // Router can hold what we're sending (including if we want to
+        // send zero bytes)
+        tx_amt_cap
+    } else {
+        // Router CAN'T hold what we're sending, send nothing
+        unsafe {
+            pipes::PIPES.spi_to_rs485.abort_rd_dma();
+        }
+        0
+    };
+    let rx_amt = if (r_tx_cap as usize) <= rx_amt_cap {
+        // We can hold what the router is sending (including if it wants
+        // to send zero bytes)
+        rx_amt_cap
+    } else {
+        unsafe {
+            pipes::PIPES.rs485_to_spi.abort_wr_dma();
+        }
+        0
+    };
+
+    let txb: [u8; 2] = (tx_amt as u16).to_le_bytes();
+    let rxb: [u8; 2] = (rx_amt as u16).to_le_bytes();
 
     txb.iter().chain(rxb.iter()).for_each(|b| {
         usart1.tdr.write(|w| w.tdr().bits((*b) as u16));
     });
 
-    usart1.cr3.modify(|_r, w| w.dmat().enabled());
+    // Enable TX complete interrupt. ISR.TC is cleared on write to TDR.
+    usart1.cr1.modify(|_r, w| {
+        w.tcie().enabled();
+        w
+    });
 
-    MODE.store(MODE_TODO, Ordering::Relaxed);
-    unsafe {
-        pipes::PIPES.trigger_rs485_tx_dma();
+    // Store amount to receive
+    RECV_AMT.store(rx_amt as u16, Ordering::Relaxed);
+
+    if tx_amt != 0 {
+        usart1.cr3.modify(|_r, w| w.dmat().enabled());
+
+        MODE.store(MODE_SEND_DMA, Ordering::Relaxed);
+        unsafe {
+            pipes::PIPES.trigger_rs485_tx_dma();
+        }
+    } else {
+        MODE.store(MODE_SEND_NO_DMA, Ordering::Relaxed);
     }
-    usart1.icr.write(|w| w.cmcf().set_bit());
 
     // defmt::println!("started dma...");
 }
