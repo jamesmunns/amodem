@@ -188,12 +188,12 @@ fn idle_start() {
         usart1.tdr.write(|w| w.tdr().bits((*b) as u16));
     });
 
-    // usart1.cr3.modify(|_r, w| w.dmat().enabled());
+    usart1.cr3.modify(|_r, w| w.dmat().enabled());
 
-    // MODE.store(MODE_TODO, Ordering::Relaxed);
-    // unsafe {
-    //     pipes::PIPES.trigger_rs485_tx_dma();
-    // }
+    MODE.store(MODE_TODO, Ordering::Relaxed);
+    unsafe {
+        pipes::PIPES.trigger_rs485_tx_dma();
+    }
     usart1.icr.write(|w| w.cmcf().set_bit());
 
     // defmt::println!("started dma...");

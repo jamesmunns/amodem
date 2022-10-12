@@ -9,7 +9,7 @@ use amodem::{
     modem::{
         setup_sys_clocks,
         setup_rolling_timer,
-        gpios::setup_gpios,
+        gpios::{setup_gpios, set_led2_inactive, set_led2_active, set_led1_inactive, set_led1_active},
         spi::{setup_spi, spi_int_unmask, exti_isr, spi_isr},
         pipes::{PIPES, self}, rs485::{setup_rs485, rs485_isr}
     }, GlobalRollingTimer,
@@ -18,7 +18,7 @@ use amodem::{
 use cortex_m::peripheral::NVIC;
 use groundhog::RollingTimer;
 use stm32g0xx_hal as hal;
-use hal::{stm32, pac::USART1};
+use hal::{stm32, pac::USART1, rtc::RtcExt};
 use hal::interrupt;
 
 
@@ -48,28 +48,50 @@ fn imain() -> Option<()> {
         board.GPIOC,
         board.EXTI
     );
-    setup_spi(&mut rcc, board.SPI1);
-    setup_rs485(&mut rcc, board.USART1);
 
-    unsafe {
-        PIPES.init(&mut rcc, board.DMA, board.DMAMUX);
-    }
+    let mut rtc = board.RTC.constrain(&mut rcc);
 
-    unsafe {
-        // TODO: Priorities. Probably in this order, highest to lowest
-        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
-        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
-        NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
-    }
-
+    let timer = GlobalRollingTimer::new();
     loop {
-        PIPES.idle_step();
-        // let usart1 = unsafe { &*USART1::PTR };
-        // while usart1.isr.read().rxne().bit_is_set() {
-        //     let data = usart1.rdr.read().rdr().bits();
-        //     defmt::println!("IDLE Got {:04X}", data);
-        // }
+        let start = timer.get_ticks();
+        set_led1_inactive();
+        set_led2_inactive();
+        while timer.millis_since(start) < 250 {}
+        set_led1_active();
+        set_led2_inactive();
+        while timer.millis_since(start) < 500 {}
+        set_led1_inactive();
+        set_led2_active();
+        while timer.millis_since(start) < 750 {}
+        set_led1_active();
+        set_led2_active();
+        while timer.millis_since(start) < 1000 {}
     }
+
+    // setup_spi(&mut rcc, board.SPI1);
+    // setup_rs485(&mut rcc, board.USART1);
+
+    // unsafe {
+    //     PIPES.init(&mut rcc, board.DMA, board.DMAMUX);
+    // }
+
+    // unsafe {
+    //     // TODO: Priorities. Probably in this order, highest to lowest
+    //     NVIC::unmask(stm32g0xx_hal::pac::Interrupt::EXTI0_1);
+    //     NVIC::unmask(stm32g0xx_hal::pac::Interrupt::SPI1);
+    //     NVIC::unmask(stm32g0xx_hal::pac::Interrupt::USART1);
+    // }
+
+    // loop {
+    //     PIPES.idle_step();
+    //     // let usart1 = unsafe { &*USART1::PTR };
+    //     // while usart1.isr.read().rxne().bit_is_set() {
+    //     //     let data = usart1.rdr.read().rdr().bits();
+    //     //     defmt::println!("IDLE Got {:04X}", data);
+    //     // }
+    // }
+
+    Some(())
 }
 
 
